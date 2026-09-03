@@ -108,7 +108,9 @@ CI runs the same command on Ubuntu and Windows for every push and pull request.
 Your Hermes Desktop  →  Tailscale CLI on this machine  →  your tailnet
 ```
 
-No Tailscale API key. No account token stored by the plugin. SSH usernames are asked per connection and not remembered. A status JSON cache may sit next to the plugin file so `tailscale status --json` is not truncated by the 4k `shell.exec` stdout cap.
+No Tailscale API key. No account token stored by the plugin. SSH usernames are asked per connection and not remembered.
+
+**The status cache.** `tailscale status --json` is longer than the 4k `shell.exec` stdout cap, so the plugin writes it to `status-cache.json` next to `plugin.js` and reads it back. That file holds what `tailscale status` shows: device names, tailnet IPs, owners, tags, OS, and last-seen times. It is rewritten on every poll (8s on the page, 60s otherwise), created `0600` on macOS and Linux, relies on the user-only profile ACL on Windows, and is deleted when the plugin unloads or Hermes quits cleanly. If Hermes crashes it stays until the next run overwrites it. Delete it by hand any time; the plugin recreates it.
 
 - **Local CLI.** Roster, ping, serve, exit node, account switch, and Taildrop all exec the installed client.
 - **Confirm before write.** Serve, exit node, account switch, and file send ask first.

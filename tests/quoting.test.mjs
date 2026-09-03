@@ -131,8 +131,27 @@ test('statusRedirectCommand quotes the output path with spaces and unicode', () 
 
   const outPath = "/home/it's me/.hermes/desktop-plugins/hermes-tailscale/status-cache.json"
   const linux = h.statusRedirectCommand({ path: '/usr/bin/tailscale' }, outPath, 'linux')
-  const target = linux.split(' > ')[1]
+  const target = linux.split(' > ')[1].split(' && ')[0]
   assert.equal(posixUnquote(target), outPath)
+})
+
+test('statusRedirectCommand (posix) creates the cache 0600 and tightens an old copy', () => {
+  const outPath = '/home/me/.hermes/desktop-plugins/hermes-tailscale/status-cache.json'
+  const cmd = h.statusRedirectCommand({ path: 'tailscale' }, outPath, 'linux')
+  assert.equal(cmd, `umask 077 && 'tailscale' status --json > '${outPath}' && chmod 600 '${outPath}'`)
+  const win = h.statusRedirectCommand({ path: 'tailscale' }, 'C:\\x\\status-cache.json', 'windows')
+  assert.doesNotMatch(win, /umask|chmod/, 'no POSIX bits on Windows')
+})
+
+test('removeCacheCommand deletes quietly on each platform', () => {
+  assert.equal(
+    h.removeCacheCommand('C:\\Users\\me me\\.hermes\\desktop-plugins\\hermes-tailscale\\status-cache.json', 'windows'),
+    'cmd /c del /q "C:\\Users\\me me\\.hermes\\desktop-plugins\\hermes-tailscale\\status-cache.json"'
+  )
+  const outPath = "/home/it's me/.hermes/desktop-plugins/hermes-tailscale/status-cache.json"
+  const rm = h.removeCacheCommand(outPath, 'linux')
+  assert.ok(rm.startsWith('rm -f '))
+  assert.equal(posixUnquote(rm.slice('rm -f '.length)), outPath)
 })
 
 test('joinPath uses the platform separator and trims trailing separators from the root', () => {

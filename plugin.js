@@ -205,8 +205,20 @@ function binCommand(bin, args, kind) {
   return `${exe} ${args}`
 }
 
+// Writes `tailscale status --json` to the cache file. On POSIX the file is
+// created 0600 (umask) and an older, wider copy is tightened (chmod). On
+// Windows the profile directory is already user-only, so plain redirect.
 function statusRedirectCommand(bin, outPath, kind) {
-  return `${binCommand(bin, 'status --json', kind)} > ${quoteShell(outPath, kind)}`
+  const target = quoteShell(outPath, kind)
+  const write = `${binCommand(bin, 'status --json', kind)} > ${target}`
+  if (kind === 'windows') return write
+  return `umask 077 && ${write} && chmod 600 ${target}`
+}
+
+// Works from both cmd.exe and PowerShell on Windows, and any POSIX sh.
+function removeCacheCommand(outPath, kind) {
+  if (kind === 'windows') return `cmd /c del /q ${quoteShell(outPath, kind)}`
+  return `rm -f ${quoteShell(outPath, kind)}`
 }
 
 function classifyCliError(result) {
@@ -827,6 +839,17 @@ async function resolveOutPath(kind) {
   if (!root) return ''
   cachedOutPath = joinPath(root, [PLUGIN_ID, CACHE_FILE], kind)
   return cachedOutPath
+}
+
+// Best effort. The gateway may already be gone when the plugin unloads.
+function removeCacheFile() {
+  const path = cachedOutPath
+  if (!path) return
+  try {
+    runShell(removeCacheCommand(path, platformKind())).catch(() => {})
+  } catch {
+    /* gateway closed first */
+  }
 }
 
 async function readCacheFile(path) {
@@ -3076,6 +3099,7 @@ export default {
       ctx.onDispose(() => {
         if (pollTimer) clearTimeout(pollTimer)
         pollTimer = null
+        removeCacheFile()
         storage = null
         os = null
         cachedBin = null
@@ -3105,6 +3129,7 @@ export const __test = {
   binaryCandidates,
   binCommand,
   statusRedirectCommand,
+  removeCacheCommand,
   classifyCliError,
   dnsLabel,
   ownerLabel,
