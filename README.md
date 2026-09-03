@@ -82,6 +82,16 @@ You need the Tailscale client installed and logged in on the same machine that r
 
 The same `plugin.js` file is both the source and the installable artifact.
 
+### Optional: keep xterm offline
+
+The SSH overlay needs xterm. By default the plugin downloads `@xterm/xterm@5.5.0/lib/xterm.js` from jsDelivr (or unpkg) and only runs it if the SHA-384 matches the pin in `plugin.js`. To skip the network, put that same file next to the plugin:
+
+```text
+~/.hermes/desktop-plugins/hermes-tailscale/xterm.js
+```
+
+Get it from the npm tarball or either CDN. The local copy is checked against the same hash, so a wrong or edited file is refused and the plugin moves on to the CDN.
+
 ### Test
 
 The helpers that build shell commands, quote paths, and parse CLI output are covered by `node:test`. No dependencies, no install step:
@@ -103,7 +113,7 @@ No Tailscale API key. No account token stored by the plugin. SSH usernames are a
 - **Local CLI.** Roster, ping, serve, exit node, account switch, and Taildrop all exec the installed client.
 - **Confirm before write.** Serve, exit node, account switch, and file send ask first.
 - **Funnel off.** Publish is `tailscale serve --bg --yes 9119`, tailnet only.
-- **SSH overlay.** The in-app terminal loads xterm from a CDN the first time. After that, keystrokes go to the local PTY.
+- **SSH overlay.** The in-app terminal is xterm 5.5.0. The plugin fetches it once, hashes the bytes, and refuses to run anything that does not match the SHA-384 pinned in `plugin.js`. It looks for `xterm.js` next to `plugin.js` first, then jsDelivr, then unpkg. After that, keystrokes go to the local PTY.
 
 Removing the plugin file does not log you out of Tailscale or delete Hermes sessions.
 
@@ -128,7 +138,7 @@ Each tagged release lists the Hermes Desktop and Tailscale versions it was teste
 - Ping, serve, and other `shell.exec` calls still have a 30 second cap. SSH and file send do not, because they use a PTY.
 - One Taildrop send at a time.
 - The SSH overlay is xterm, not a full Desktop terminal app. Fine for a shell, `apt`, and passwords. A poor place to live in tmux all day.
-- xterm is fetched at runtime. Offline first launch falls back to a plain log if the CDN cannot load.
+- xterm is fetched at runtime unless you drop a copy next to `plugin.js`. Offline first launch with no local copy falls back to a plain log.
 
 <br />
 
