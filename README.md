@@ -35,7 +35,7 @@ Most Tailscale UIs live in a tray icon or a browser tab you forget to open. This
 | | |
 | --- | --- |
 | **See**<br />Name, OS, IPv4, and one status line. Online count in the status bar. Empty states if Tailscale is missing, stopped, or waiting for login. | **Copy**<br />IP, MagicDNS, or an `ssh` line. Palette commands for the page and your own address. |
-| **Reach**<br />Ping a peer. Open SSH in an xterm overlay. Type the username each time. It is not saved. | **Move**<br />Send a file with Taildrop and watch the bar fill. Pick an exit node. Switch accounts when more than one is logged in. Publish this Hermes with `tailscale serve` on port 9119. |
+| **Reach**<br />Ping a peer. Open SSH in an xterm overlay. Type the username each time. It is not saved. | **Move**<br />Send a file with Taildrop and watch the bar fill. Pick an exit node. Switch accounts when more than one is logged in. Publish this Hermes with `tailscale serve`. You pick the local port; the plugin checks something is listening before it runs. |
 
 Mutating actions ask first. Funnel stays off.
 
@@ -112,7 +112,7 @@ No Tailscale API key. No account token stored by the plugin. SSH usernames are a
 
 - **Local CLI.** Roster, ping, serve, exit node, account switch, and Taildrop all exec the installed client.
 - **Confirm before write.** Serve, exit node, account switch, and file send ask first.
-- **Funnel off.** Publish is `tailscale serve --bg --yes 9119`, tailnet only.
+- **Funnel off.** Publish is `tailscale serve --bg --yes <port>`, tailnet only. The port defaults to 9119, is editable in the confirm bar, and is remembered per profile. Before running serve the plugin checks that something answers on `127.0.0.1:<port>` (a renderer fetch, then `curl`). If nothing does, serve is not run. If it cannot tell, it says so and asks again.
 - **SSH overlay.** The in-app terminal is xterm 5.5.0. The plugin fetches it once, hashes the bytes, and refuses to run anything that does not match the SHA-384 pinned in `plugin.js`. It looks for `xterm.js` next to `plugin.js` first, then jsDelivr, then unpkg. After that, keystrokes go to the local PTY.
 
 Removing the plugin file does not log you out of Tailscale or delete Hermes sessions.
@@ -133,7 +133,7 @@ Each tagged release lists the Hermes Desktop and Tailscale versions it was teste
 
 ## Limits
 
-- Serve is hardcoded to local port 9119. Hermes' own dashboard port can differ.
+- The serve port check only proves a listener exists. It does not prove that listener is Hermes.
 - A remote gateway shows *that* machine's tailnet, not the laptop in front of you.
 - Ping, serve, and other `shell.exec` calls still have a 30 second cap. SSH and file send do not, because they use a PTY.
 - One Taildrop send at a time.
