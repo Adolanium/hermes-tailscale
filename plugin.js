@@ -88,6 +88,7 @@ const $dialog = atom(null)
 const $ping = atom({})
 const $ssh = atom(null)
 const $sshAsk = atom(null)
+const $publishAsk = atom(null)
 const $notice = atom('')
 const $send = atom(null)
 
@@ -479,6 +480,36 @@ function isSafeUser(value) {
   const s = String(value || '').trim()
   if (!s || s.length > 32) return false
   return /^[A-Za-z_][A-Za-z0-9._-]*$/.test(s)
+}
+
+// A TCP port typed by the user. 0 means "not a port".
+function parsePort(value) {
+  const s = String(value == null ? '' : value).trim()
+  if (!/^\d{1,5}$/.test(s)) return 0
+  const n = Number(s)
+  return n >= 1 && n <= 65535 ? n : 0
+}
+
+function serveArgs(port) {
+  return `serve --bg --yes ${parsePort(port)}`
+}
+
+// curl is on Windows 10+, macOS, and nearly every Linux. It only has to tell
+// us whether something answers on the loopback port; the body is discarded.
+// On Windows the .exe suffix skips PowerShell's curl alias (Invoke-WebRequest).
+function portProbeCommand(port, kind) {
+  if (kind === 'windows') return `curl.exe -s -o NUL -m 3 http://127.0.0.1:${parsePort(port)}/`
+  return `curl -s -o /dev/null -m 3 http://127.0.0.1:${parsePort(port)}/`
+}
+
+// 'open' when something answered (any HTTP status), 'closed' when the
+// connection was refused, 'unknown' when curl is missing or gave up.
+function classifyPortProbe(result) {
+  if (!result) return 'unknown'
+  const code = Number(result.code)
+  if (code === 0 || code === 22) return 'open'
+  if (code === 7) return 'closed'
+  return 'unknown'
 }
 
 function sshSpec(user, dest) {
@@ -1082,13 +1113,57 @@ async function pingRow(row) {
   }
 }
 
-async function publishHermes() {
-  const result = await runCli(`serve --bg --yes ${HERMES_PORT}`)
+function servePort() {
+  return parsePort(stored('servePort', HERMES_PORT)) || HERMES_PORT
+}
+
+// Is anything listening on 127.0.0.1:port? Tries a renderer fetch first
+// (fast, no shell). A refused connection and a CSP block both throw, so on
+// failure ask curl through shell.exec, which can tell the two apart.
+async function probeLocalPort(port) {
+  const n = parsePort(port)
+  if (!n) return 'closed'
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 3000)
+    try {
+      await fetch(`http://127.0.0.1:${n}/`, { mode: 'no-cors', cache: 'no-store', signal: controller.signal })
+      return 'open'
+    } finally {
+      clearTimeout(timer)
+    }
+  } catch {
+    /* refused, blocked, or timed out */
+  }
+  try {
+    const result = await runShell(portProbeCommand(n, platformKind()))
+    return classifyPortProbe(result)
+  } catch {
+    return 'unknown'
+  }
+}
+
+function openPublishAsk(replaces) {
+  $publishAsk.set({ replaces: replaces || '' })
+}
+
+function closePublishAsk() {
+  $publishAsk.set(null)
+}
+
+async function publishHermes(port) {
+  const n = parsePort(port)
+  if (!n) {
+    say('That is not a valid port.')
+    return
+  }
+  const result = await runCli(serveArgs(n))
   if (!result.ok) {
     say(result.stderr.trim() || result.stdout.trim() || 'tailscale serve failed')
     return
   }
-  say(`Serving local port ${HERMES_PORT} on the tailnet`)
+  remember('servePort', n)
+  say(`Serving local port ${n} on the tailnet`)
   refresh()
 }
 
@@ -1854,6 +1929,109 @@ function SshAskBar() {
   })
 }
 
+function PublishBar() {
+  const ask = useValue($publishAsk)
+  const [port, setPort] = useState('')
+  const [check, setCheck] = useState({ state: 'idle', port: 0 })
+  useEffect(() => {
+    setPort(ask ? String(servePort()) : '')
+    setCheck({ state: 'idle', port: 0 })
+  }, [!!ask])
+  if (!ask) return null
+  const n = parsePort(port)
+  const busy = check.state === 'busy'
+  const publish = () => {
+    closePublishAsk()
+    publishHermes(n)
+  }
+  const go = async () => {
+    if (!n || busy) return
+    tap()
+    setCheck({ state: 'busy', port: n })
+    const found = await probeLocalPort(n)
+    if (found === 'open') {
+      publish()
+      return
+    }
+    setCheck({ state: found, port: n })
+  }
+  const inputStyle = {
+    height: 28,
+    width: 88,
+    padding: '0 8px',
+    borderRadius: 6,
+    border: `1px solid ${n ? 'var(--ui-stroke-secondary)' : text.red}`,
+    background: 'transparent',
+    color: text.primary,
+    font: 'inherit',
+    fontSize: '0.8125rem',
+    outline: 'none'
+  }
+  const replaces = ask.replaces ? ` This replaces the current target (${ask.replaces}).` : ''
+  let verdict = null
+  if (check.state === 'closed' && check.port === n) {
+    verdict = `Nothing is listening on 127.0.0.1:${n}. Serve was not changed. Check the Hermes dashboard port and try again.`
+  } else if (check.state === 'unknown' && check.port === n) {
+    verdict = `Could not check 127.0.0.1:${n} (curl missing or the port did not answer in 3 seconds). Publish anyway only if you are sure Hermes is on that port.`
+  }
+  return jsxs('div', {
+    style: {
+      padding: '10px 16px',
+      borderBottom: '1px solid var(--ui-stroke-secondary)',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 8,
+      background: 'var(--ui-bg-secondary, transparent)'
+    },
+    children: [
+      jsx('div', {
+        style: { fontSize: '0.8125rem', fontWeight: 600, color: text.primary },
+        children: 'Publish Hermes on the tailnet?'
+      }),
+      jsx('div', {
+        style: { fontSize: '0.75rem', color: text.secondary, lineHeight: 1.45, maxWidth: 640 },
+        children: `This runs tailscale serve --bg on the local port below. Other devices on the tailnet can open https://<this-node>.<tailnet>.ts.net and reach whatever listens there. It is not Funnel. It is not on the public internet.${replaces}`
+      }),
+      jsxs('div', {
+        style: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' },
+        children: [
+          jsx('span', { style: { fontSize: '0.75rem', color: text.secondary }, children: 'Local port' }),
+          jsx('input', {
+            value: port,
+            inputMode: 'numeric',
+            autoFocus: true,
+            disabled: busy,
+            onChange: event => setPort(event.target.value),
+            onKeyDown: event => {
+              if (event.key === 'Enter') {
+                event.preventDefault()
+                go()
+              }
+            },
+            style: inputStyle
+          }),
+          jsx(SmallButton, {
+            active: true,
+            disabled: !n || busy,
+            onClick: go,
+            children: busy ? `Checking ${check.port}…` : 'Publish'
+          }),
+          check.state === 'unknown' && check.port === n
+            ? jsx(SmallButton, { onClick: publish, children: 'Publish anyway' })
+            : null,
+          jsx(SmallButton, { onClick: closePublishAsk, children: 'Cancel' })
+        ]
+      }),
+      verdict
+        ? jsx('div', {
+            style: { fontSize: '0.75rem', color: check.state === 'closed' ? text.red : text.yellow, lineHeight: 1.45, maxWidth: 640 },
+            children: verdict
+          })
+        : null
+    ]
+  })
+}
+
 function ConfirmBar() {
   const dialog = useValue($dialog)
   if (!dialog) return null
@@ -2489,13 +2667,8 @@ function Page() {
                 : snap.kind === 'ready' && !vacant
                   ? jsx(SmallButton, {
                       onClick: () => {
-                        const extra = serve && serve.proxy ? ` This replaces the current target (${serve.proxy}).` : ''
-                        ask(
-                          'Publish Hermes on the tailnet?',
-                          `This runs tailscale serve --bg on local port ${HERMES_PORT}. Other devices on the tailnet can open https://<this-node>.<tailnet>.ts.net. It is not Funnel. It is not on the public internet.${extra}`,
-                          'Publish',
-                          () => publishHermes()
-                        )
+                        tap()
+                        openPublishAsk(serve && serve.proxy ? serve.proxy : '')
                       },
                       children: 'Publish'
                     })
@@ -2715,6 +2888,7 @@ function Page() {
         ]
       }),
       jsx(SshAskBar, {}),
+      jsx(PublishBar, {}),
       jsx(ConfirmBar, {}),
       jsx(SendBar, {}),
       jsx(NoticeLine, {}),
@@ -2880,12 +3054,9 @@ export default {
           keywords: ['tailscale', 'serve', 'publish', 'share', 'https'],
           run: () => {
             go(ROUTE)
-            ask(
-              'Publish Hermes on the tailnet?',
-              `This runs tailscale serve --bg on local port ${HERMES_PORT}. Other devices on the tailnet can open https://<this-node>.<tailnet>.ts.net. It is not Funnel. It is not on the public internet.`,
-              'Publish',
-              () => publishHermes()
-            )
+            const snap = $snap.get()
+            const serve = snap && snap.kind === 'ready' && snap.serve ? snap.serve : null
+            openPublishAsk(serve && serve.proxy ? serve.proxy : '')
           }
         }
       }
@@ -2912,6 +3083,7 @@ export default {
         cachedOutPath = null
         closeSsh()
         $sshAsk.set(null)
+        $publishAsk.set(null)
         stopSendPty()
         $send.set(null)
         if (noticeTimer) clearTimeout(noticeTimer)
@@ -2951,6 +3123,10 @@ export const __test = {
   barOk,
   isSafeHost,
   isSafeUser,
+  parsePort,
+  serveArgs,
+  portProbeCommand,
+  classifyPortProbe,
   sshSpec,
   parsePingOutput,
   pingSummary,
