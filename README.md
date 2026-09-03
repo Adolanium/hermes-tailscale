@@ -101,7 +101,15 @@ Removing the plugin file does not log you out of Tailscale or delete Hermes sess
 
 Hermes Tailscale uses the desktop plugin SDK and `host.request('shell.exec')`. SSH and Taildrop progress use `window.hermesDesktop.terminal` when this Desktop build has it.
 
-It is tested on Windows with Hermes Desktop. macOS and Linux use the same CLI door, with POSIX quoting and zsh/bash/sh as the PTY shell instead of PowerShell.
+| Platform | Tailscale CLI | PTY shell | Status |
+| --- | --- | --- | --- |
+| Windows 11 | Current stable (`C:\Program Files\Tailscale\tailscale.exe` or on PATH) | PowerShell | Tested with each release |
+| macOS | Current stable (Homebrew, standalone, or the App Store binary) | zsh | Same CLI door, POSIX quoting. Not yet tested by the maintainer |
+| Linux | Current stable (`/usr/bin`, `/usr/local/bin`, or snap) | bash or sh | Same CLI door, POSIX quoting. Not yet tested by the maintainer |
+
+The CLI needs `tailscale serve --bg` (Tailscale 1.48 or newer). Hermes Desktop: any build that ships the desktop plugin SDK and `shell.exec`. SSH and Taildrop progress additionally need `hermesDesktop.terminal`; without it the ssh line is copied and file send runs under `shell.exec` with no progress bar.
+
+Each tagged release lists the Hermes Desktop and Tailscale versions it was tested against. If you run it on a row marked "not yet tested" and it works, open an issue and say so.
 
 ## Limits
 
@@ -120,6 +128,10 @@ It is tested on Windows with Hermes Desktop. macOS and Linux use the same CLI do
 </div>
 
 <br />
+
+## License
+
+[MIT](LICENSE).
 
 > **Community project**
 >
