@@ -19,7 +19,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'hermes-tailscale'
 const PLUGIN_NAME = 'Tailscale'
-const VERSION = '0.0.1'
+const VERSION = '0.0.2'
 const ROUTE = '/tailscale'
 const PAGE_POLL_MS = 8 * 1000
 const BAR_POLL_MS = 60 * 1000
@@ -622,16 +622,21 @@ function pathBase(filePath) {
 
 function isSafeFilePath(filePath) {
   const s = String(filePath || '')
-  return !!s && !/[\r\n\0]/.test(s)
+  return !!s && !/[\r\n\0"]/.test(s)
+}
+
+function quoteCmdArg(value) {
+  return `"${String(value).replace(/"/g, '')}"`
 }
 
 function fileCpCommand(bin, kind, filePath, dest) {
+  if (kind === 'windows') {
+    const exe = bin && bin.path && /[\\/]/.test(String(bin.path)) ? String(bin.path) : 'tailscale'
+    return `echo HERMES_SEND_START\rcmd --% /c call ${quoteCmdArg(exe)} file cp ${quoteCmdArg(filePath)} ${quoteCmdArg(dest)}\rif ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }\rexit 0\r`
+  }
   const args = `file cp ${quoteShell(filePath, kind)} ${quoteShell(dest, kind)}`
   const line = shellLine(bin, args, kind)
-  if (kind === 'windows') {
-    return `${line}; if ($null -eq $LASTEXITCODE) { exit 0 }; exit $LASTEXITCODE\r`
-  }
-  return `${line}; exit $?\r`
+  return `echo HERMES_SEND_START; ${line}; echo HERMES_SEND_DONE:$?; exit $?\r`
 }
 
 function parseFileCpProgress(existingLog, incoming) {
@@ -661,9 +666,11 @@ function parseFileCpProgress(existingLog, incoming) {
       if (sizeMatch) size = sizeMatch[1]
       continue
     }
-    if (/^PS /i.test(line) || /HERMES_SEND_DONE/.test(line)) continue
+    if (/^PS /i.test(line) || /HERMES_SEND_/.test(line)) continue
+    if (/^cmd --%/i.test(line) || /^echo HERMES_/i.test(line)) continue
     extra.push(line)
   }
+  const detail = extra.length ? extra[extra.length - 1].slice(0, 180) : ''
   return {
     log: log.slice(-12000),
     percent,
@@ -671,7 +678,9 @@ function parseFileCpProgress(existingLog, incoming) {
     eta,
     size,
     warning,
-    extra
+    extra,
+    detail,
+    started: /HERMES_SEND_START/.test(log)
   }
 }
 
@@ -687,6 +696,7 @@ function sendStatusText(job) {
   if (job.size) bits.push(job.size)
   if (job.rate) bits.push(job.rate)
   if (job.eta) bits.push(`ETA ${job.eta}`)
+  else if (job.detail && job.percent == null) bits.push(job.detail)
   return bits.join(' · ')
 }
 
@@ -1090,18 +1100,13 @@ function stopSendPty() {
 function patchSend(patch) {
   const cur = $send.get()
   if (!cur) return
-  const next = { ...cur, ...patch }
-  if (
-    next.state === cur.state &&
-    next.percent === cur.percent &&
-    next.rate === cur.rate &&
-    next.eta === cur.eta &&
-    next.size === cur.size &&
-    next.text === cur.text
-  ) {
-    return
-  }
-  $send.set(next)
+  $send.set({ ...cur, ...patch })
+}
+
+function cancelSend() {
+  const cur = $send.get()
+  if (!cur || cur.state !== 'busy') return
+  finishSend({ state: 'err', text: 'Cancelled' })
 }
 
 function finishSend(patch) {
@@ -1148,6 +1153,8 @@ async function sendFilePty(bin, kind, filePath, dest) {
     await sendFileShell(bin, kind, filePath, dest)
     return
   }
+  const open = $send.get()
+  if (open) $send.set({ ...open, ptyId: id })
   let finished = false
   const unsubData = bridge.terminal.onData(id, chunk => {
     const cur = $send.get()
@@ -1159,6 +1166,7 @@ async function sendFilePty(bin, kind, filePath, dest) {
     if (parsed.eta) next.eta = parsed.eta
     if (parsed.size) next.size = parsed.size
     if (parsed.warning) next.warning = parsed.warning
+    if (parsed.detail) next.detail = parsed.detail
     patchSend(next)
   })
   const unsubExit = bridge.terminal.onExit
@@ -1187,7 +1195,6 @@ async function sendFilePty(bin, kind, filePath, dest) {
       bridge.terminal.dispose(id).catch(() => undefined)
     }
   }
-  patchSend({ ptyId: id })
   if (typeof bridge.terminal.attach === 'function') {
     const attached = await bridge.terminal.attach(id)
     if (!attached) {
@@ -1197,10 +1204,19 @@ async function sendFilePty(bin, kind, filePath, dest) {
     }
   }
   const command = fileCpCommand(bin, kind, filePath, dest)
-  await new Promise(resolve => setTimeout(resolve, 350))
+  await new Promise(resolve => setTimeout(resolve, 500))
   const cur = $send.get()
-  if (!cur || cur.ptyId !== id || finished) return
+  if (!cur || cur.state !== 'busy' || finished) return
   await bridge.terminal.write(id, command)
+  setTimeout(() => {
+    const job = $send.get()
+    if (!job || job.ptyId !== id || job.state !== 'busy' || finished) return
+    if (job.percent == null) {
+      patchSend({
+        warning: job.warning || 'Still working. Tailscale only prints a percent when it has a real console.'
+      })
+    }
+  }, 6000)
 }
 
 async function sendFile(row) {
@@ -1245,6 +1261,7 @@ async function sendFile(row) {
     eta: '',
     size: '',
     warning: '',
+    detail: '',
     log: '',
     text: `Sending ${name}`
   })
@@ -1628,12 +1645,22 @@ function SendBar() {
       gap: 6
     },
     children: [
-      jsx('div', {
-        style: {
-          fontSize: '0.75rem',
-          color: failed ? text.red : busy ? text.primary : text.secondary
-        },
-        children: sendStatusText(job)
+      jsxs('div', {
+        style: { display: 'flex', alignItems: 'center', gap: 8 },
+        children: [
+          jsx('div', {
+            style: {
+              fontSize: '0.75rem',
+              color: failed ? text.red : busy ? text.primary : text.secondary,
+              minWidth: 0,
+              flex: 1
+            },
+            children: sendStatusText(job)
+          }),
+          busy
+            ? jsx(SmallButton, { onClick: cancelSend, children: 'Cancel' })
+            : null
+        ]
       }),
       job.warning
         ? jsx('div', { style: { fontSize: '0.6875rem', color: text.yellow }, children: job.warning })
