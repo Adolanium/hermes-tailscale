@@ -19,7 +19,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'hermes-tailscale'
 const PLUGIN_NAME = 'Tailscale'
-const VERSION = '0.0.2'
+const VERSION = '0.0.3'
 const ROUTE = '/tailscale'
 const PAGE_POLL_MS = 8 * 1000
 const BAR_POLL_MS = 60 * 1000
