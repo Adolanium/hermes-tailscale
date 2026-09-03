@@ -2743,6 +2743,7 @@ function copyMyIp() {
 export default {
   id: PLUGIN_ID,
   name: PLUGIN_NAME,
+  version: VERSION,
   description: 'Machines on this device\'s Tailscale tailnet. Talks to the local CLI.',
   defaultEnabled: true,
   register(ctx) {
