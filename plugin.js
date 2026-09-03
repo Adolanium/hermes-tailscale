@@ -28,9 +28,18 @@ const QUAD100_URL = 'http://100.100.100.100'
 const CACHE_FILE = 'status-cache.json'
 const HERMES_PORT = 9119
 const TAILDROP_AVAILABLE = 1
-const XTERM_ESM = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/+esm'
-const XTERM_ESM_ALT = 'https://esm.sh/@xterm/xterm@5.5.0'
-const XTERM_UMD = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js'
+const XTERM_VERSION = '5.5.0'
+const XTERM_FILE = 'xterm.js'
+// SHA-384 of lib/xterm.js inside the @xterm/xterm@5.5.0 npm tarball. jsDelivr
+// and unpkg serve that file byte for byte, so one pin covers both mirrors and
+// a local copy. Never point this at a /+esm or .min.js URL: those are built
+// per CDN and their bytes are not stable. Bump XTERM_VERSION and this hash
+// together.
+const XTERM_SHA384 = 'sha384-M169f14mRZOXm3hD/v2Ti0ThIT/RnAQagXA9nlE15yHAtrW19gdePJh/HaTzUOe/'
+const XTERM_URLS = [
+  `https://cdn.jsdelivr.net/npm/@xterm/xterm@${XTERM_VERSION}/lib/${XTERM_FILE}`,
+  `https://unpkg.com/@xterm/xterm@${XTERM_VERSION}/lib/${XTERM_FILE}`
+]
 
 const host = sdk.host
 const {
@@ -61,6 +70,7 @@ let pollTimer = null
 let inFlight = false
 let pageMounted = 0
 let cachedBin = null
+let cachedRoot = ''
 let cachedOutPath = null
 let sshStop = null
 let noticeTimer = null
@@ -123,6 +133,43 @@ function joinPath(root, parts, kind) {
   const sep = kind === 'windows' ? '\\' : '/'
   const clean = String(root || '').replace(/[\\/]+$/, '')
   return [clean, ...parts].join(sep)
+}
+
+// Where to look for xterm, in order: a copy next to plugin.js, then each
+// pinned CDN URL. Every candidate is checked against the same hash.
+function xtermSources(root, kind, pluginId, fileName, urls) {
+  const out = []
+  if (root) out.push({ kind: 'file', path: joinPath(root, [pluginId, fileName], kind) })
+  for (const url of urls || []) out.push({ kind: 'url', url })
+  return out
+}
+
+function integrityMatches(expected, digestBase64) {
+  const want = String(expected || '').replace(/^sha384-/, '')
+  const got = String(digestBase64 || '')
+  return want.length === 64 && want === got
+}
+
+// Shadows the CommonJS and AMD globals so xterm's UMD header falls through
+// to `root.Terminal = ...` with root = globalThis, then exports that.
+function wrapXtermModule(text) {
+  return `let exports, module, define;\n${text}\nexport default globalThis.Terminal\n`
+}
+
+function bytesToBase64(bytes) {
+  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)
+  const table = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  let out = ''
+  for (let i = 0; i < view.length; i += 3) {
+    const a = view[i]
+    const b = i + 1 < view.length ? view[i + 1] : 0
+    const c = i + 2 < view.length ? view[i + 2] : 0
+    const n = (a << 16) | (b << 8) | c
+    out += table[(n >> 18) & 63] + table[(n >> 12) & 63]
+    out += i + 1 < view.length ? table[(n >> 6) & 63] : '='
+    out += i + 2 < view.length ? table[n & 63] : '='
+  }
+  return out
 }
 
 function binaryCandidates(kind) {
@@ -726,21 +773,29 @@ async function runShell(command) {
   return host.request('shell.exec', { command })
 }
 
-async function resolveOutPath(kind) {
-  if (cachedOutPath) return cachedOutPath
+async function resolvePluginsRoot() {
+  if (cachedRoot) return cachedRoot
   const bridge = desktop()
   if (bridge && typeof bridge.desktopPluginsRoot === 'function') {
     try {
       const root = await bridge.desktopPluginsRoot()
       if (root) {
-        cachedOutPath = joinPath(root, [PLUGIN_ID, CACHE_FILE], kind)
-        return cachedOutPath
+        cachedRoot = String(root)
+        return cachedRoot
       }
     } catch {
       /* older shell */
     }
   }
   return ''
+}
+
+async function resolveOutPath(kind) {
+  if (cachedOutPath) return cachedOutPath
+  const root = await resolvePluginsRoot()
+  if (!root) return ''
+  cachedOutPath = joinPath(root, [PLUGIN_ID, CACHE_FILE], kind)
+  return cachedOutPath
 }
 
 async function readCacheFile(path) {
@@ -1337,27 +1392,62 @@ function ctorFromModule(mod) {
   return null
 }
 
-function importFromUrl(href) {
-  return import(href)
+async function sha384Base64(bytes) {
+  const digest = await crypto.subtle.digest('SHA-384', bytes)
+  return bytesToBase64(new Uint8Array(digest))
 }
 
-function loadUmd(url) {
-  return new Promise((resolve, reject) => {
-    const script = document.createElement('script')
-    script.src = url
-    script.async = true
-    script.onload = () => {
-      const Terminal = globalThis.Terminal
-      script.remove()
-      if (typeof Terminal === 'function') resolve(Terminal)
-      else reject(new Error('UMD build did not expose Terminal'))
-    }
-    script.onerror = () => {
-      script.remove()
-      reject(new Error('UMD script failed to load'))
-    }
-    document.head.appendChild(script)
-  })
+// Reads one xterm candidate (local file or CDN) as bytes. Nothing here is
+// executed. The caller hashes the bytes first.
+async function fetchXtermBytes(source) {
+  if (source.kind === 'file') {
+    const bridge = desktop()
+    if (!bridge || typeof bridge.readFileText !== 'function') throw new Error('no file bridge')
+    const result = await bridge.readFileText(source.path)
+    if (!result || result.truncated || !result.text) throw new Error('missing or truncated')
+    return new TextEncoder().encode(String(result.text))
+  }
+  const response = await fetch(source.url)
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  return new Uint8Array(await response.arrayBuffer())
+}
+
+// Runs already-verified xterm source from a blob URL. The plugin itself is a
+// blob module, so blob: is an allowed script origin. The verified text is
+// wrapped so the UMD header takes its global branch no matter what the
+// renderer exposes, then Terminal is read back off globalThis.
+async function executeXterm(bytes) {
+  const text = new TextDecoder().decode(bytes)
+  const moduleUrl = URL.createObjectURL(new Blob([wrapXtermModule(text)], { type: 'text/javascript' }))
+  try {
+    const mod = await import(moduleUrl)
+    const ctor = ctorFromModule(mod) || globalThis.Terminal
+    if (typeof ctor === 'function') return ctor
+  } catch {
+    /* fall through to a classic script tag */
+  } finally {
+    URL.revokeObjectURL(moduleUrl)
+  }
+  const scriptUrl = URL.createObjectURL(new Blob([bytes], { type: 'text/javascript' }))
+  try {
+    return await new Promise((resolve, reject) => {
+      const script = document.createElement('script')
+      script.src = scriptUrl
+      script.async = true
+      script.onload = () => {
+        script.remove()
+        if (typeof globalThis.Terminal === 'function') resolve(globalThis.Terminal)
+        else reject(new Error('xterm did not expose Terminal'))
+      }
+      script.onerror = () => {
+        script.remove()
+        reject(new Error('blob script failed to run'))
+      }
+      document.head.appendChild(script)
+    })
+  } finally {
+    URL.revokeObjectURL(scriptUrl)
+  }
 }
 
 async function loadTerminal() {
@@ -1370,26 +1460,27 @@ async function loadTerminal() {
   if (xtermLoad) return xtermLoad
   xtermLoad = (async () => {
     injectXtermCss()
+    const kind = platformKind()
+    const root = await resolvePluginsRoot()
     const errors = []
-    for (const url of [XTERM_ESM, XTERM_ESM_ALT]) {
+    for (const source of xtermSources(root, kind, PLUGIN_ID, XTERM_FILE, XTERM_URLS)) {
+      const label = source.kind === 'file' ? source.path : source.url
       try {
-        const ctor = ctorFromModule(await importFromUrl(url))
-        if (ctor) {
-          TerminalCtor = ctor
-          return ctor
+        const bytes = await fetchXtermBytes(source)
+        const digest = await sha384Base64(bytes)
+        if (!integrityMatches(XTERM_SHA384, digest)) {
+          errors.push(`${label}: hash mismatch, refused to run it`)
+          continue
         }
-        errors.push(`${url}: no Terminal export`)
+        TerminalCtor = await executeXterm(bytes)
+        return TerminalCtor
       } catch (err) {
-        errors.push(`${url}: ${err && err.message ? err.message : String(err)}`)
+        errors.push(`${label}: ${err && err.message ? err.message : String(err)}`)
       }
     }
-    try {
-      TerminalCtor = await loadUmd(XTERM_UMD)
-      return TerminalCtor
-    } catch (err) {
-      errors.push(`umd: ${err && err.message ? err.message : String(err)}`)
-    }
-    throw new Error(`Could not load a terminal emulator. ${errors.join(' | ')}`)
+    throw new Error(
+      `Could not load a verified terminal emulator. Put xterm ${XTERM_VERSION} lib/${XTERM_FILE} next to plugin.js, or allow cdn.jsdelivr.net. ${errors.join(' | ')}`
+    )
   })()
   try {
     return await xtermLoad
@@ -2817,6 +2908,7 @@ export default {
         storage = null
         os = null
         cachedBin = null
+        cachedRoot = ''
         cachedOutPath = null
         closeSsh()
         $sshAsk.set(null)
@@ -2834,6 +2926,10 @@ export const __test = {
   platformKind,
   quoteShell,
   joinPath,
+  xtermSources,
+  integrityMatches,
+  wrapXtermModule,
+  bytesToBase64,
   binaryCandidates,
   binCommand,
   statusRedirectCommand,
