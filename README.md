@@ -18,6 +18,9 @@
 
   [See the roster](#the-tailnet-in-the-sidebar) &nbsp;·&nbsp; [Install it](#make-it-yours) &nbsp;·&nbsp; [How it talks to Tailscale](#privacy-you-can-explain-in-one-breath)
 
+  <img width="1453" height="884" alt="demo" src="https://github.com/user-attachments/assets/28516903-8f3a-42a1-9a9d-823981272073" />
+
+
 </div>
 
 ## Powered by Hermes
