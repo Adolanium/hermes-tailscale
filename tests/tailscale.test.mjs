@@ -135,7 +135,7 @@ test('statusRedirectCommand quotes spaces on Windows and sets TAILSCALE_BE_CLI o
   )
   assert.ok(
     mac.startsWith(
-      "TAILSCALE_BE_CLI=1 '/Applications/Tailscale.app/Contents/MacOS/Tailscale' status --json > "
+      "umask 077 && TAILSCALE_BE_CLI=1 '/Applications/Tailscale.app/Contents/MacOS/Tailscale' status --json > "
     )
   )
 })

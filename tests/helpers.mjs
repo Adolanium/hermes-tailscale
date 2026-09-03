@@ -25,6 +25,7 @@ export const names = [
   'binaryCandidates',
   'binCommand',
   'statusRedirectCommand',
+  'removeCacheCommand',
   'classifyCliError',
   'dnsLabel',
   'ownerLabel',
