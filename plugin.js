@@ -94,7 +94,7 @@ const TAILDROP = {
   9: 'Owned by another user'
 }
 
-// --- helpers (tested) ---
+// --- helpers (tested by tests/*.test.mjs, which slice this block out) ---
 
 function errorMessage(error, fallback) {
   if (typeof error === 'string' && error && error !== '[object Object]') return error
@@ -2871,6 +2871,7 @@ export const __test = {
   applyPtyText,
   pathBase,
   isSafeFilePath,
+  quoteCmdArg,
   fileCpCommand,
   parseFileCpProgress,
   sendStatusText
