@@ -82,6 +82,16 @@ You need the Tailscale client installed and logged in on the same machine that r
 
 The same `plugin.js` file is both the source and the installable artifact.
 
+### Test
+
+The helpers that build shell commands, quote paths, and parse CLI output are covered by `node:test`. No dependencies, no install step:
+
+```text
+node --test
+```
+
+CI runs the same command on Ubuntu and Windows for every push and pull request.
+
 ## Privacy you can explain in one breath
 
 ```text
