@@ -12,7 +12,7 @@
   See who is online, copy an address, SSH in, send a file, or publish this Hermes onto the mesh.
   It talks to the Tailscale CLI you already installed. No admin API token. No cloud round trip.
 
-  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.0.3</sub>
+  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.0.4</sub>
 
   <br /><br />
 
@@ -158,3 +158,66 @@ Each tagged release lists the Hermes Desktop and Tailscale versions it was teste
 > **Community project**
 >
 > Hermes Tailscale is an independent community plugin. It is not affiliated with, endorsed by, sponsored by, or officially associated with [Nous Research](https://github.com/NousResearch), the [Hermes Agent project](https://github.com/NousResearch/hermes-agent), or [Tailscale](https://tailscale.com). Hermes, Hermes Agent, Nous Research, and Tailscale are names and marks belonging to their respective owners.
+
+
+## Signed updates and recovery
+
+At the bottom of Tailscale, choose **Check for updates**. The plugin checks [its own GitHub releases](https://github.com/Adolanium/hermes-tailscale/releases) and asks before installing. **Update now** downloads the offered version; **Later** leaves the installation unchanged. Checking alone downloads only release metadata.
+
+Every update has an ECDSA P-256 signature verified against the public key embedded in the plugin. The signed metadata binds the repository, plugin identity, version, exact commit, file list, sizes, and SHA-256 hashes. Unsigned releases, changed downloads, and automatic downgrades are rejected. A signature verifies origin and integrity, not the absence of bugs.
+
+The updater replaces only `plugin.js`. It requires no additional Python, Git, package manager, or updater service. All file operations use stock Desktop APIs on the **local Desktop profile**, even when the gateway is remote. Saved settings are preserved.
+
+**Restore previous version** verifies the last complete backup and asks before restoring. Choose **Restore now** or **Cancel**. Updating or restoring reloads the plugin, so finish active work first. Terminal connections may close. Use **Reload desktop plugins** or restart Desktop if the screen does not refresh.
+
+Backups remain beside the installed files as `update-<id>-backup-<filename>`. Failed replacements attempt to restore every original file. Desktop does not expose an atomic multi-file replacement: a crash between renames can require manual recovery. Close Desktop, move any replaced files aside, restore **all files from the same backup ID** to their original names, then reopen Desktop. For example, `update-<id>-backup-plugin.js` becomes `plugin.js`.
+
+Existing installations need one manual installation of this updater-enabled version. Later versions can use the confirmation flow above. Hermes Agent source changes are not required.
+
+### Publishing updates
+
+The release description must contain a signed `hermes-desktop-update` block using schema 2. Publish a stable tag `v<VERSION>` against the exact pushed commit named in the signature. This plugin accepts only `Adolanium/hermes-tailscale`, plugin ID `hermes-tailscale`, and `plugin.js`. Signing is a maintainer operation; the private signing key must stay outside the repository and never ship to users.
+
+<details>
+<summary>Maintainer signing procedure</summary>
+
+Update VERSION, test, commit, and push. Save this script outside the repository as sign-release.mjs and run node /path/to/sign-release.mjs FULL_COMMIT_SHA from the repository. It prints the path of the signed release notes. Publish with gh release create vVERSION --target FULL_COMMIT_SHA --notes-file NOTES_PATH. Keep the signed block unchanged when adding notes. Only maintainers need Node.js and Git.
+
+The private key is read from HERMES_PLUGIN_SIGNING_KEY, or the maintainer's ~/.hermes-ssh-release/signing-key.pem. This is the existing family signing identity; signatures also bind each release to its own repository. Back up the key securely. Key rotation needs a release signed by the previous key or a manual reinstall.
+
+```js
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+
+const commit = process.argv[2];
+if (!/^[a-f0-9]{40}$/.test(commit || '')) throw Error('Use a full pushed commit SHA.');
+const source = execFileSync('git', ['show', `${commit}:plugin.js`]).toString('utf8');
+const plugin = source.match(/const PLUGIN_ID\s*=\s*['"]([^'"]+)['"]/)?.[1];
+const version = source.match(/const VERSION\s*=\s*['"]([^'"]+)['"]/)?.[1];
+const repo = source.match(/repo: "(Adolanium\/[^"]+)"/)?.[1];
+const names = JSON.parse(source.match(/files: (\[[^\]]+\])/)[1]);
+const pinned = source.match(/const UPDATE_KEY = "([^"]+)"/)?.[1];
+if (!plugin || !/^\d+\.\d+\.\d+$/.test(version) || !repo ||
+    names.some(name => !['plugin.js', 'probe.py'].includes(name))) throw Error('Invalid updater configuration.');
+const origin = execFileSync('git', ['remote', 'get-url', 'origin'], { encoding: 'utf8' }).trim().replace(/\.git$/, '');
+if (origin !== `https://github.com/${repo}` && origin !== `git@github.com:${repo}`) throw Error('Repository does not match origin.');
+const key = fs.readFileSync(process.env.HERMES_PLUGIN_SIGNING_KEY || path.join(os.homedir(), '.hermes-ssh-release', 'signing-key.pem'));
+if (crypto.createPublicKey(key).export({ type: 'spki', format: 'der' }).toString('base64') !== pinned) throw Error('Signing key does not match the plugin.');
+const files = names.map(name => {
+  const content = execFileSync('git', ['show', `${commit}:${name}`]);
+  if (!content.length || content.length > 500000) throw Error('Release file exceeds updater limits.');
+  return { name, sha256: crypto.createHash('sha256').update(content).digest('hex'), bytes: content.length };
+});
+const payload = Buffer.from(JSON.stringify({ schema: 2, plugin, repo, version, commit, files }));
+const signature = crypto.sign('sha256', payload, { key, dsaEncoding: 'ieee-p1363' });
+const envelope = { payload: payload.toString('base64'), signature: signature.toString('base64') };
+const output = path.join(os.tmpdir(), repo.split('/')[1] + '-release-notes.md');
+fs.writeFileSync(output, `${repo.split('/')[1]} v${version}\n\nSigned updates and backup recovery, with confirmation before each change.\n\n\`\`\`hermes-desktop-update\n${JSON.stringify(envelope)}\n\`\`\`\n`);
+console.log(output);
+
+```
+
+</details>
