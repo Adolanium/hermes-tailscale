@@ -19,7 +19,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'hermes-tailscale'
 const PLUGIN_NAME = 'Tailscale'
-const VERSION = '0.0.4'
+const VERSION = '0.0.5'
 const ROUTE = '/tailscale'
 const PAGE_POLL_MS = 8 * 1000
 const BAR_POLL_MS = 60 * 1000
@@ -3066,7 +3066,7 @@ function createDesktopUpdater(config) {
     const envelope = JSON.parse(block[1]), payload = decode(envelope.payload);
     const key = await crypto.subtle.importKey('spki', decode(config.key), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
     if (!await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, decode(envelope.signature), payload)) throw Error('The release signature is invalid. Nothing was installed.');
-    const info = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(payload));
+    const info = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(payload));
     parts(info.version);
     if (info.schema !== 2 || info.plugin !== config.id || info.repo !== config.repo || release.tag_name !== 'v' + info.version ||
         !/^[a-f0-9]{40}$/.test(info.commit) || !Array.isArray(info.files) || info.files.length !== config.files.length)
@@ -3099,7 +3099,7 @@ function createDesktopUpdater(config) {
       const data = new Uint8Array(size);
       let offset = 0;
       for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.length; }
-      return new TextDecoder('utf-8', { fatal: true }).decode(data);
+      return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data);
     } catch (error) {
       if (error.name === 'AbortError') throw Error('The update check timed out. Try again.');
       throw error;
