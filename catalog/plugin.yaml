@@ -1,0 +1,12 @@
+{
+  "name": "hermes-tailscale",
+  "version": "0.0.5.post1",
+  "description": "Browse Tailscale devices and connect to remote Hermes instances in Hermes Desktop.",
+  "author": "Adolanium",
+  "manifest_version": 1,
+  "kind": "standalone",
+  "provides_tools": [],
+  "provides_hooks": [],
+  "provides_middleware": [],
+  "requires_env": []
+}

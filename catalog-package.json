@@ -1,0 +1,7 @@
+{
+  "name": "hermes-tailscale",
+  "version": "0.0.5.post1",
+  "description": "Browse Tailscale devices and connect to remote Hermes instances in Hermes Desktop.",
+  "updater": "shared",
+  "companions": []
+}
