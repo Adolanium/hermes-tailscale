@@ -12,7 +12,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
 
-export const source = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
+export const source = readFileSync(new URL(process.env.HERMES_TEST_CATALOG ? '../catalog/desktop/plugin.js' : '../plugin.js', import.meta.url), 'utf8')
 
 export const names = [
   'platformKind',

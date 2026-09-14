@@ -160,7 +160,7 @@ Each tagged release lists the Hermes Desktop and Tailscale versions it was teste
 > Hermes Tailscale is an independent community plugin. It is not affiliated with, endorsed by, sponsored by, or officially associated with [Nous Research](https://github.com/NousResearch), the [Hermes Agent project](https://github.com/NousResearch/hermes-agent), or [Tailscale](https://tailscale.com). Hermes, Hermes Agent, Nous Research, and Tailscale are names and marks belonging to their respective owners.
 
 
-## Signed updates and recovery
+## Standalone Desktop signed updates and recovery
 
 At the bottom of Tailscale, choose **Check for updates**. The plugin checks [its own GitHub releases](https://github.com/Adolanium/hermes-tailscale/releases) and asks before installing. **Update now** downloads the offered version; **Later** leaves the installation unchanged. Checking alone downloads only release metadata.
 
@@ -246,11 +246,10 @@ and move its folder out of the Desktop plugin directory; Hermes intentionally
 does not overwrite manual installations. Keep plugin settings when migrating.
 
 After catalog admission, use `hermes plugins update hermes-tailscale` and rescan
-Desktop plugins to adopt a reviewed update. The packaged copy's update and restore
-actions cannot replace its files from GitHub releases. Standalone signed updates
+Desktop plugins to adopt a reviewed update. The packaged copy has no in-app update or restore controls. Its release downloader, signature verifier, backup/restore updater, and code-replacement helpers are removed at build time. Standalone signed updates
 continue to use the existing root files.
 
 For development, edit the root files, then run `python scripts/build_catalog.py`.
 Commit the resulting `catalog/` files. CI runs `python scripts/build_catalog.py --check`
 to keep the package current, including any companion files. Catalog packaging
-releases use `catalog-v0.0.5-1` and are not marked as the latest standalone release.
+releases use `catalog-v0.0.5-2` and are not marked as the latest standalone release.

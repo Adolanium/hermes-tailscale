@@ -11,5 +11,9 @@ jobs:
         with:
           python-version: '3.11'
       - run: python scripts/build_catalog.py --check
+      - run: python -m unittest test_catalog_policy.py
       - run: python -m py_compile catalog/__init__.py
       - run: node --check catalog/desktop/plugin.js
+      - run: node --test tests/*.test.mjs
+        env:
+          HERMES_TEST_CATALOG: '1'
