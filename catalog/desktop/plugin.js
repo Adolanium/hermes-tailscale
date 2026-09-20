@@ -325,6 +325,11 @@ function cacheReadVerdict(result) {
   if (!looksCompleteJson(text)) {
     return { text: '', reason: 'corrupt', detail: 'the cache file is not a complete JSON object' }
   }
+  try {
+    JSON.parse(text)
+  } catch {
+    return { text: '', reason: 'corrupt', detail: 'the cache file contains invalid JSON' }
+  }
   return { text, reason: 'ok', detail: '' }
 }
 
@@ -1064,11 +1069,17 @@ async function probeBinary(kind) {
   return { bin: null, error: null, kind: kindOut }
 }
 
-// One atomic write → read cycle. Cache problems never throw: the reason
-// travels in the result. A daemon error on the write is returned as a
-// snapshot so loadSnapshot can render the usual daemon card.
+// One atomic write → read cycle. Cache failures carry a reason so inline
+// status can still run. Gateway failures keep the disconnected card.
 async function cacheWriteReadCycle(bin, outPath, kind) {
-  const redirected = await runShell(atomicStatusRedirectCommand(bin, outPath, kind, cacheTmpToken()))
+  let redirected
+  try {
+    redirected = await runShell(atomicStatusRedirectCommand(bin, outPath, kind, cacheTmpToken()))
+  } catch (error) {
+    const message = errorMessage(error, 'Could not write the status cache')
+    if (/gateway unavailable/i.test(message)) throw error
+    return { text: '', reason: 'write', detail: firstLine(message, 160) }
+  }
   if (redirected && redirected.code) {
     const why = classifyCliError(redirected)
     if (why === 'daemon') {
