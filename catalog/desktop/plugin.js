@@ -19,7 +19,9 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'hermes-tailscale'
 const PLUGIN_NAME = 'Tailscale'
-const VERSION = '0.0.5'
+// 0.0.6: atomic status-cache write (mkdir + unique tmp + rename), reason-
+// returning cache read, one rebuild retry, precise cache errors.
+const VERSION = '0.0.6'
 const ROUTE = '/tailscale'
 const PAGE_POLL_MS = 8 * 1000
 const BAR_POLL_MS = 60 * 1000
@@ -205,6 +207,8 @@ function binCommand(bin, args, kind) {
   return `${exe} ${args}`
 }
 
+// Superseded by atomicStatusRedirectCommand (kept for compatibility with the
+// existing test surface; runtime no longer uses a plain truncating redirect).
 // Writes `tailscale status --json` to the cache file. On POSIX the file is
 // created 0600 (umask) and an older, wider copy is tightened (chmod). On
 // Windows the profile directory is already user-only, so plain redirect.
@@ -219,6 +223,164 @@ function statusRedirectCommand(bin, outPath, kind) {
 function removeCacheCommand(outPath, kind) {
   if (kind === 'windows') return `cmd /c del /q ${quoteShell(outPath, kind)}`
   return `rm -f ${quoteShell(outPath, kind)}`
+}
+
+// --- status cache ---------------------------------------------------------
+//
+// `tailscale status --json` is much larger than the 4 KB the gateway returns
+// for a shell command, so the plugin writes the CLI's stdout to a cache file
+// and reads the file back over the desktop bridge. The helpers below keep
+// that route honest: the write is atomic (a reader sees the old or the new
+// file, never a half-written one), the cache directory is created first, and
+// every failure carries a reason so the card can name the real problem
+// instead of blaming truncation.
+
+function looksCompleteJson(text) {
+  const s = String(text || '').trim()
+  return s.startsWith('{') && s.endsWith('}')
+}
+
+function cacheDirPath(outPath) {
+  const s = String(outPath || '')
+  const cut = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'))
+  return cut > 0 ? s.slice(0, cut) : ''
+}
+
+// Unique per write so concurrent writers never share a temp file; the tokens
+// only need to be unique inside one directory.
+function cacheTmpToken(now, rand) {
+  const t = Number.isFinite(now) ? now : Date.now()
+  const r = Number.isFinite(rand) ? rand : Math.random()
+  return `${t}-${Math.abs(Math.floor(r * 0x100000000)).toString(16)}`
+}
+
+function cacheTmpPath(outPath, token) {
+  return `${String(outPath || '')}.tmp-${String(token || '')}`
+}
+
+// Best effort on Windows: `cmd /c mkdir` fails when the directory already
+// exists, which the `&` chain in atomicStatusRedirectCommand tolerates; the
+// redirect itself reports the real error when the directory cannot be made.
+function ensureCacheDirCommand(outPath, kind) {
+  const dir = cacheDirPath(outPath)
+  if (!dir) return ''
+  if (kind === 'windows') return `cmd /c mkdir ${quoteShell(dir, kind)}`
+  return `mkdir -p ${quoteShell(dir, kind)}`
+}
+
+// Same-volume rename/replace — the atomic step on both platforms.
+function cacheReplaceCommand(tmpPath, outPath, kind) {
+  if (kind === 'windows') {
+    return `cmd /c move /y ${quoteShell(tmpPath, kind)} ${quoteShell(outPath, kind)}`
+  }
+  return `mv -f ${quoteShell(tmpPath, kind)} ${quoteShell(outPath, kind)}`
+}
+
+// Writes `tailscale status --json` to the cache file atomically. POSIX keeps
+// the file 0600 (umask at creation, chmod tightens a pre-existing temp) and
+// Windows relies on the user-profile ACL, as before.
+function atomicStatusRedirectCommand(bin, outPath, kind, token) {
+  const tmpName = cacheTmpPath(outPath, token)
+  const tmp = quoteShell(tmpName, kind)
+  const write = `${binCommand(bin, 'status --json', kind)} > ${tmp}`
+  const replace = cacheReplaceCommand(tmpName, outPath, kind)
+  const mkdir = ensureCacheDirCommand(outPath, kind)
+  if (kind === 'windows') {
+    return `${mkdir ? `${mkdir} & ` : ''}${write} && ${replace}`
+  }
+  return `${mkdir ? `${mkdir} && ` : ''}umask 077 && ${write} && chmod 600 ${tmp} && ${replace}`
+}
+
+// Removes the cache file and any temp files an aborted write left behind.
+// Both commands tolerate missing targets (best effort).
+function removeCacheArtifactsCommand(outPath, kind) {
+  const tmpPattern = `${outPath}.tmp-*`
+  if (kind === 'windows') {
+    return `${removeCacheCommand(outPath, kind)} & cmd /c del /q ${quoteShell(tmpPattern, kind)}`
+  }
+  return `rm -f ${quoteShell(outPath, kind)} ${quoteShell(`${outPath}.tmp-`, kind)}*`
+}
+
+// Maps a rejected bridge read to a stable reason. The messages come from the
+// desktop IPC ("Text preview failed: …"); anything unrecognized is
+// unreadable rather than a guess at something worse.
+function cacheReadErrorReason(error) {
+  const message = errorMessage(error, '')
+  if (/does not exist|not found|ENOENT|ENOTDIR/i.test(message)) return 'missing'
+  if (/too large|EFBIG/i.test(message)) return 'too-large'
+  return 'unreadable'
+}
+
+// Verdict on what a bridge read produced. Text is only handed back when it
+// is a complete JSON object; the reason is what the caller acts on.
+function cacheReadVerdict(result) {
+  if (!result || typeof result !== 'object') {
+    return { text: '', reason: 'bridge', detail: 'the desktop bridge returned no data' }
+  }
+  if (result.truncated) {
+    return { text: '', reason: 'too-large', detail: 'the cache file exceeds the desktop read limit' }
+  }
+  const text = String(result.text || '')
+  if (!text.trim()) return { text: '', reason: 'empty', detail: 'the cache file is empty' }
+  if (!looksCompleteJson(text)) {
+    return { text: '', reason: 'corrupt', detail: 'the cache file is not a complete JSON object' }
+  }
+  try {
+    JSON.parse(text)
+  } catch {
+    return { text: '', reason: 'corrupt', detail: 'the cache file contains invalid JSON' }
+  }
+  return { text, reason: 'ok', detail: '' }
+}
+
+// First non-empty line, trimmed and capped — shell errors are one line and
+// the card should never quote more than that.
+function firstLine(value, limit) {
+  const line =
+    String(value || '')
+      .split(/\r?\n/)
+      .map(part => part.trim())
+      .filter(Boolean)[0] || ''
+  const cap = Number.isFinite(limit) && limit > 0 ? limit : 200
+  return line.length > cap ? `${line.slice(0, cap)}…` : line
+}
+
+function cacheReasonText(reason, detail) {
+  const extra = detail ? ` (${detail})` : ''
+  switch (reason) {
+    case 'write':
+      return `the cache write failed${extra}`
+    case 'missing':
+      return `the cache file does not exist${extra}`
+    case 'unreadable':
+      return `the cache file is not readable${extra}`
+    case 'too-large':
+      return `the cache file is too large for the desktop reader${extra}`
+    case 'corrupt':
+      return `the cache file is not a complete JSON object${extra}`
+    case 'empty':
+      return `the cache file is empty${extra}`
+    case 'bridge':
+      return `this Hermes shell cannot read local files for the plugin${extra}`
+    default:
+      return `the cache file could not be read${extra}`
+  }
+}
+
+// Card body when the cache route produced nothing usable and the inline
+// fallback was the 4 KB tail. Names the cache path and the real reason;
+// never claims truncation for a write or a read failure. `connectionId`
+// comes from the desktop host state: 'local' (or unknown/null) means the
+// shell runs on this machine; anything else is a connection id, so the
+// cache is written on the connected host and read from here.
+function cacheFailureMessage(outPath, reason, detail, connectionId) {
+  const where = outPath ? ` (${outPath})` : ''
+  const head = `Could not read the Tailscale status cache${where}: ${cacheReasonText(reason, detail)}.`
+  const remote = typeof connectionId === 'string' && connectionId && connectionId !== 'local'
+  const why = remote
+    ? ` The status cache is written on the connected host (${connectionId}) but read from this machine.`
+    : ''
+  return `${head}${why} Hermes only returns the last 4k of a shell command, so the full 'tailscale status --json' cannot be recovered inline.`
 }
 
 function classifyCliError(result) {
@@ -816,6 +978,19 @@ async function runShell(command) {
   return host.request('shell.exec', { command })
 }
 
+// 'local' (or unknown/null) means the shell runs on this machine; any other
+// value is a connection id, i.e. shell.exec runs on the connected host.
+function desktopConnectionId() {
+  try {
+    const state = host && host.state
+    const signal = state && state.connectionId
+    const value = signal && typeof signal.get === 'function' ? signal.get() : null
+    return typeof value === 'string' && value ? value : null
+  } catch {
+    return null
+  }
+}
+
 async function resolvePluginsRoot() {
   if (cachedRoot) return cachedRoot
   const bridge = desktop()
@@ -842,27 +1017,32 @@ async function resolveOutPath(kind) {
 }
 
 // Best effort. The gateway may already be gone when the plugin unloads.
+// Also clears temp files a failed or aborted atomic write left behind.
 function removeCacheFile() {
   const path = cachedOutPath
   if (!path) return
   try {
-    runShell(removeCacheCommand(path, platformKind())).catch(() => {})
+    runShell(removeCacheArtifactsCommand(path, platformKind())).catch(() => {})
   } catch {
     /* gateway closed first */
   }
 }
 
+// Read the cache through the desktop bridge and say WHY when it fails: a
+// rejection becomes a reason, not an exception, so callers (and the inline
+// fallback) always get to run.
 async function readCacheFile(path) {
+  if (!path) return { text: '', reason: 'bridge', detail: 'no cache path could be resolved' }
   const bridge = desktop()
-  if (!bridge || typeof bridge.readFileText !== 'function' || !path) return ''
-  const result = await bridge.readFileText(path)
-  if (!result || result.truncated) return ''
-  return String(result.text || '')
-}
-
-function looksCompleteJson(text) {
-  const s = String(text || '').trim()
-  return s.startsWith('{') && s.endsWith('}')
+  if (!bridge || typeof bridge.readFileText !== 'function') {
+    return { text: '', reason: 'bridge', detail: 'this Hermes shell has no local file reader' }
+  }
+  try {
+    const result = await bridge.readFileText(path)
+    return cacheReadVerdict(result)
+  } catch (error) {
+    return { text: '', reason: cacheReadErrorReason(error), detail: firstLine(errorMessage(error, ''), 160) }
+  }
 }
 
 async function probeBinary(kind) {
@@ -889,6 +1069,50 @@ async function probeBinary(kind) {
   return { bin: null, error: null, kind: kindOut }
 }
 
+// One atomic write → read cycle. Cache failures carry a reason so inline
+// status can still run. Gateway failures keep the disconnected card.
+async function cacheWriteReadCycle(bin, outPath, kind) {
+  let redirected
+  try {
+    redirected = await runShell(atomicStatusRedirectCommand(bin, outPath, kind, cacheTmpToken()))
+  } catch (error) {
+    const message = errorMessage(error, 'Could not write the status cache')
+    if (/gateway unavailable/i.test(message)) throw error
+    return { text: '', reason: 'write', detail: firstLine(message, 160) }
+  }
+  if (redirected && redirected.code) {
+    const why = classifyCliError(redirected)
+    if (why === 'daemon') {
+      return {
+        text: '',
+        reason: 'write',
+        detail: '',
+        snapshot: { kind: 'daemon', message: 'Tailscale is installed, but the daemon is not running.' }
+      }
+    }
+    return { text: '', reason: 'write', detail: firstLine(redirected.stderr || redirected.stdout, 160) }
+  }
+  const read = await readCacheFile(outPath)
+  return { text: read.text, reason: read.reason, detail: read.detail }
+}
+
+// The cache route with the documented one-shot recovery: when the write
+// succeeded but the file is missing, empty or corrupt — a crash leftover, or
+// the app replaced the plugin folder mid-poll — remove it and rebuild once.
+async function readStatusViaCache(bin, outPath, kind) {
+  let cycle = await cacheWriteReadCycle(bin, outPath, kind)
+  if (cycle.snapshot) return cycle
+  if (cycle.reason === 'missing' || cycle.reason === 'corrupt' || cycle.reason === 'empty') {
+    try {
+      await runShell(removeCacheCommand(outPath, kind))
+    } catch {
+      /* best effort */
+    }
+    cycle = await cacheWriteReadCycle(bin, outPath, kind)
+  }
+  return cycle
+}
+
 async function loadSnapshot() {
   const gateway = host.state && host.state.gateway ? host.state.gateway.get() : ''
   if (gateway && gateway !== 'open') {
@@ -913,23 +1137,23 @@ async function loadSnapshot() {
   }
 
   const outPath = await resolveOutPath(kind)
+  const connectionId = desktopConnectionId()
   let rawText = ''
+  let cachePath = outPath
+  let cacheReason = 'bridge'
+  let cacheDetail = ''
   try {
     if (outPath) {
-      const redirected = await runShell(statusRedirectCommand(probed.bin, outPath, kind))
-      if (redirected && redirected.code) {
-        const why = classifyCliError(redirected)
-        if (why === 'daemon') {
-          return { kind: 'daemon', message: 'Tailscale is installed, but the daemon is not running.' }
-        }
-        // A missing cache directory looks like "cannot find the path" on
-        // Windows. The version probe already proved the binary exists, so
-        // fall through to the inline status read.
-      } else {
-        rawText = await readCacheFile(outPath)
-      }
+      const cycle = await readStatusViaCache(probed.bin, outPath, kind)
+      if (cycle.snapshot) return cycle.snapshot
+      rawText = cycle.text
+      cacheReason = cycle.reason
+      cacheDetail = cycle.detail
     }
     if (!looksCompleteJson(rawText)) {
+      // The inline route returns the last 4,000 chars of stdout, which is
+      // never authoritative for a tailnet whose status exceeds 4 KB — it is
+      // only accepted below when it happens to be one complete JSON object.
       const inline = await runShell(binCommand(probed.bin, 'status --json', kind))
       if (inline && inline.code) {
         const why = classifyCliError(inline)
@@ -955,10 +1179,7 @@ async function loadSnapshot() {
 
   const trimmed = rawText.trim()
   if (!looksCompleteJson(trimmed)) {
-    return {
-      kind: 'error',
-      message: 'Tailscale status was truncated. Hermes only returns the last 4k of a shell command, and the cache file could not be read.'
-    }
+    return { kind: 'error', message: cacheFailureMessage(cachePath, cacheReason, cacheDetail, connectionId) }
   }
   let parsed
   try {
@@ -3143,6 +3364,19 @@ export const __test = {
   binCommand,
   statusRedirectCommand,
   removeCacheCommand,
+  atomicStatusRedirectCommand,
+  removeCacheArtifactsCommand,
+  cacheDirPath,
+  cacheTmpToken,
+  cacheTmpPath,
+  ensureCacheDirCommand,
+  cacheReplaceCommand,
+  cacheReadErrorReason,
+  cacheReadVerdict,
+  cacheFailureMessage,
+  cacheReasonText,
+  looksCompleteJson,
+  firstLine,
   classifyCliError,
   dnsLabel,
   ownerLabel,
