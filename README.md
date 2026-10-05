@@ -249,7 +249,16 @@ After catalog admission, use `hermes plugins update hermes-tailscale` and rescan
 Desktop plugins to adopt a reviewed update. The packaged copy has no in-app update or restore controls. Its release downloader, signature verifier, backup/restore updater, and code-replacement helpers are removed at build time. Standalone signed updates
 continue to use the existing root files.
 
-For development, edit the root files, then run `python scripts/build_catalog.py`.
-Commit the resulting `catalog/` files. CI runs `python scripts/build_catalog.py --check`
-to keep the package current, including any companion files. Catalog packaging
-releases use `catalog-v0.0.5-2` and are not marked as the latest standalone release.
+The catalog copy statically bundles xterm 5.5.0 and its MIT license. Opening a
+terminal requires no CDN download, script injection, or SDK extension. The root
+standalone distribution keeps its existing loader.
+
+For development, use Node.js 22 or newer and Python 3.11 or newer. Run
+`npm ci --ignore-scripts`, edit the root files, then run
+`python scripts/build_catalog.py`. Commit the generated `catalog/` files and
+the dependency lockfile. CI verifies them with
+`python scripts/build_catalog.py --check`. Run the browser regression with
+`npx playwright install chromium` and `npm run test:browser`. The test uses the
+packaged terminal with external requests blocked and checks rendering, keyboard
+input, resizing, and disposal. Catalog packaging
+releases use `catalog-v0.0.6` and are not marked as the latest standalone release.

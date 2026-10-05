@@ -1,0 +1,14 @@
+{
+  "name": "hermes-tailscale",
+  "version": "0.0.6",
+  "private": true,
+  "scripts": {
+    "test:browser": "node scripts/test_catalog_terminal.mjs"
+  },
+  "devDependencies": {
+    "@xterm/xterm": "5.5.0",
+    "esbuild": "0.25.12",
+    "playwright": "1.63.0",
+    "react": "19.3.0"
+  }
+}

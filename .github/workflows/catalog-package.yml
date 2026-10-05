@@ -10,6 +10,12 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: '3.11'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npx playwright install --with-deps chromium
       - run: python scripts/build_catalog.py --check
       - run: python -m unittest test_catalog_policy.py
       - run: python -m py_compile catalog/__init__.py
@@ -17,3 +23,4 @@ jobs:
       - run: node --test tests/*.test.mjs
         env:
           HERMES_TEST_CATALOG: '1'
+      - run: npm run test:browser
