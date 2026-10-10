@@ -73,6 +73,7 @@ export const names = [
   'parsePingOutput',
   'pingSummary',
   'parseServeStatus',
+  'safeWebUrl',
   'parseSwitchList',
   'canReceiveFiles',
   'exitNodeChoices',
@@ -95,7 +96,8 @@ export function loadHelpers() {
   const start = source.indexOf('const TAILDROP = {')
   const end = source.indexOf('// --- runtime ---')
   assert.ok(start >= 0 && end > start, 'helper block markers missing')
-  const context = vm.createContext({})
+  // URL is a host API, not a language builtin; the link checks need it.
+  const context = vm.createContext({ URL })
   vm.runInContext(
     `const TAILDROP_AVAILABLE = 1;\n${source.slice(start, end)}\nglobalThis.__h = { ${names.join(', ')} };`,
     context
