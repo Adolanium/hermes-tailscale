@@ -752,7 +752,8 @@ function parseStatus(raw, nowMs) {
     suffix: String(suffix || ''),
     tailnet: (raw.CurrentTailnet && raw.CurrentTailnet.Name) || '',
     magicDns: !!(raw.CurrentTailnet && raw.CurrentTailnet.MagicDNSEnabled),
-    authUrl: raw.AuthURL || '',
+    authUrl: safeWebUrl(raw.AuthURL),
+    authUrlBlocked: !!raw.AuthURL && !safeWebUrl(raw.AuthURL),
     selfIps: Array.isArray(raw.TailscaleIPs) ? raw.TailscaleIPs.map(String) : selfRow ? selfRow.ips : [],
     exitNode: exit && exit.ID ? { id: String(exit.ID), online: !!exit.Online } : null,
     rows
@@ -872,6 +873,25 @@ function pingSummary(parsed) {
   return `${last.ms}ms ${path}`
 }
 
+// Links from Tailscale output (the login URL, the serve address) come from
+// whichever host runs the CLI, so they are checked before they are shown or
+// opened. Only an absolute http(s) URL with a host passes; no base URL, so
+// relative and protocol-relative strings fail. Returns the parsed href (the
+// exact value that was checked), or '' when the value is not a web link.
+function safeWebUrl(value) {
+  const s = String(value == null ? '' : value).trim()
+  if (!s) return ''
+  let parsed
+  try {
+    parsed = new URL(s)
+  } catch {
+    return ''
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return ''
+  if (!parsed.hostname) return ''
+  return parsed.href
+}
+
 function parseServeStatus(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return { empty: true, url: '', proxy: '', hostPort: '' }
@@ -887,7 +907,7 @@ function parseServeStatus(raw) {
     const root = handlers['/'] || (keys.length ? handlers[keys[0]] : null)
     proxy = (root && (root.Proxy || root.Path || '')) || ''
   }
-  const url = /:\/\//.test(hostPort) ? hostPort : `https://${hostPort}`
+  const url = safeWebUrl(/:\/\//.test(hostPort) ? hostPort : `https://${hostPort}`)
   return { empty: false, url, proxy: String(proxy), hostPort }
 }
 
@@ -1569,13 +1589,22 @@ function onPageMount() {
   }
 }
 
+const BLOCKED_LINK_MESSAGE = 'Tailscale returned a link that is not an http or https address, so it was not opened.'
+
+// Every caller goes through the same check; the plugin's own constants are
+// plain https/http URLs and pass unchanged.
 function openUrl(url) {
-  tap()
-  if (os && typeof os.openExternal === 'function') {
-    os.openExternal(url)
+  const safe = safeWebUrl(url)
+  if (!safe) {
+    say(BLOCKED_LINK_MESSAGE)
     return
   }
-  if (typeof window !== 'undefined') window.open(url, '_blank', 'noopener')
+  tap()
+  if (os && typeof os.openExternal === 'function') {
+    os.openExternal(safe)
+    return
+  }
+  if (typeof window !== 'undefined') window.open(safe, '_blank', 'noopener')
 }
 
 async function copyText(value) {
@@ -2855,6 +2884,7 @@ function EmptyState({ snap }) {
   } else if (statusKind === 'login') {
     title = 'Not logged in'
     body = 'This device is not on a tailnet yet. Log in from the Tailscale app, the local web UI, or the CLI.'
+    if (snap.status && snap.status.authUrlBlocked) body = `${body} ${BLOCKED_LINK_MESSAGE}`
     actions = [
       authUrl ? { label: 'Log in', run: () => openUrl(authUrl) } : { label: 'Open local UI', run: () => openUrl(QUAD100_URL) },
       { label: 'Copy tailscale up', run: () => copyText('tailscale up') }
@@ -3166,8 +3196,9 @@ function PluginPageContent() {
               serve && !serve.empty
                 ? jsx(SmallButton, {
                     active: true,
-                    title: serve.url,
-                    onClick: () => openUrl(serve.url),
+                    title: serve.url || `${serve.hostPort} (not an http or https address)`,
+                    disabled: !serve.url,
+                    onClick: serve.url ? () => openUrl(serve.url) : undefined,
                     children: 'Serving'
                   })
                 : snap.kind === 'ready' && !vacant
@@ -3672,6 +3703,7 @@ export const __test = {
   parsePingOutput,
   pingSummary,
   parseServeStatus,
+  safeWebUrl,
   parseSwitchList,
   canReceiveFiles,
   exitNodeChoices,

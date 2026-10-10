@@ -274,7 +274,7 @@ test('parseServeStatus reads the live HTTPS proxy URL', () => {
     }
   })
   assert.equal(live.empty, false)
-  assert.equal(live.url, 'https://main.tail52478.ts.net:443')
+  assert.equal(live.url, 'https://main.tail52478.ts.net/')
   assert.equal(live.proxy, 'http://127.0.0.1:9119')
 })
 
