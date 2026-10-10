@@ -21,6 +21,9 @@ const PLUGIN_ID = 'hermes-tailscale'
 const PLUGIN_NAME = 'Tailscale'
 // 0.0.6: atomic status-cache write (mkdir + unique tmp + rename), reason-
 // returning cache read, one rebuild retry, precise cache errors.
+// Remote gateways: shell commands follow the connected host's OS (probed once
+// per connection). POSIX hosts stream status JSON in chunks; the desktop
+// cache file is local-only. Desktop terminal commands keep the desktop OS.
 const VERSION = '0.0.6'
 const ROUTE = '/tailscale'
 const PAGE_POLL_MS = 8 * 1000
@@ -126,6 +129,21 @@ function platformKind(nav) {
   return 'linux'
 }
 
+// `uname -s` on the host that actually runs shell.exec. Any clean answer is
+// a POSIX shell ('darwin' for macOS, 'linux' for Linux, BSD and the rest).
+// cmd and PowerShell answer "not recognized" (cmd exits 9009): Windows.
+// Anything else is unclear and returns '' so the caller does not cache it.
+function classifyShellHost(result) {
+  if (!result || typeof result !== 'object') return ''
+  const stdout = String(result.stdout || '')
+  const stderr = String(result.stderr || '')
+  if (result.code === 9009 || /not recognized/i.test(`${stdout}\n${stderr}`)) return 'windows'
+  if (result.code) return ''
+  const name = stdout.trim().split(/\r?\n/).filter(Boolean)[0] || ''
+  if (!name) return ''
+  return /^darwin$/i.test(name) ? 'darwin' : 'linux'
+}
+
 function quoteShell(value, kind) {
   const s = String(value)
   if (kind === 'windows') return `"${s.replace(/"/g, '\\"')}"`
@@ -171,6 +189,34 @@ function bytesToBase64(bytes) {
     out += table[(n >> 18) & 63] + table[(n >> 12) & 63]
     out += i + 1 < view.length ? table[(n >> 6) & 63] : '='
     out += i + 2 < view.length ? table[n & 63] : '='
+  }
+  return out
+}
+
+// Inverse of bytesToBase64. Whitespace is ignored so a wrapped `base64`
+// stdout (GNU coreutils and BSD both fold at 76 columns) decodes per chunk.
+// Callers concatenate the bytes and decode UTF-8 once, so a code point split
+// across two chunks stays intact.
+function base64ToBytes(text) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  const clean = String(text || '').replace(/[^A-Za-z0-9+/=]/g, '')
+  if (!clean) return new Uint8Array(0)
+  const pad = clean.endsWith('==') ? 2 : clean.endsWith('=') ? 1 : 0
+  const outLen = Math.max(0, Math.floor((clean.length * 3) / 4) - pad)
+  const out = new Uint8Array(outLen)
+  let o = 0
+  for (let i = 0; i < clean.length && o < out.length; i += 4) {
+    const a = alphabet.indexOf(clean[i])
+    const b = alphabet.indexOf(clean[i + 1] || 'A')
+    const cChar = clean[i + 2]
+    const dChar = clean[i + 3]
+    const c = !cChar || cChar === '=' ? 0 : alphabet.indexOf(cChar)
+    const d = !dChar || dChar === '=' ? 0 : alphabet.indexOf(dChar)
+    if (a < 0 || b < 0 || c < 0 || d < 0) break
+    const n = (a << 18) | (b << 12) | (c << 6) | d
+    if (o < out.length) out[o++] = (n >> 16) & 255
+    if (o < out.length) out[o++] = (n >> 8) & 255
+    if (o < out.length) out[o++] = n & 255
   }
   return out
 }
@@ -228,9 +274,11 @@ function removeCacheCommand(outPath, kind) {
 // --- status cache ---------------------------------------------------------
 //
 // `tailscale status --json` is much larger than the 4 KB the gateway returns
-// for a shell command, so the plugin writes the CLI's stdout to a cache file
-// and reads the file back over the desktop bridge. The helpers below keep
-// that route honest: the write is atomic (a reader sees the old or the new
+// for a shell command. On a local connection the plugin writes the CLI's
+// stdout to a cache file and reads it back over the desktop bridge. A remote
+// connection must not use that file: the shell would write it on the gateway
+// and the desktop would read a different machine. The helpers below keep the
+// local route honest: the write is atomic (a reader sees the old or the new
 // file, never a half-written one), the cache directory is created first, and
 // every failure carries a reason so the card can name the real problem
 // instead of blaming truncation.
@@ -367,6 +415,12 @@ function cacheReasonText(reason, detail) {
   }
 }
 
+// 'local' and unknown/null run the shell on this machine. Any other string
+// is a connection id: shell.exec runs on that host.
+function isRemoteConnection(connectionId) {
+  return typeof connectionId === 'string' && connectionId !== '' && connectionId !== 'local'
+}
+
 // Card body when the cache route produced nothing usable and the inline
 // fallback was the 4 KB tail. Names the cache path and the real reason;
 // never claims truncation for a write or a read failure. `connectionId`
@@ -376,11 +430,72 @@ function cacheReasonText(reason, detail) {
 function cacheFailureMessage(outPath, reason, detail, connectionId) {
   const where = outPath ? ` (${outPath})` : ''
   const head = `Could not read the Tailscale status cache${where}: ${cacheReasonText(reason, detail)}.`
-  const remote = typeof connectionId === 'string' && connectionId && connectionId !== 'local'
+  const remote = isRemoteConnection(connectionId)
   const why = remote
     ? ` The status cache is written on the connected host (${connectionId}) but read from this machine.`
     : ''
   return `${head}${why} Hermes only returns the last 4k of a shell command, so the full 'tailscale status --json' cannot be recovered inline.`
+}
+
+// Remote POSIX status read. The shell writes `tailscale status --json` to a
+// 0600 temp file, prints the byte size and path, and keeps the CLI's exit
+// status (`&&` would hide the path when tailscale fails, and then we could
+// not delete the file). Chunks are raw bytes, base64'd, small enough that
+// the gateway's 4 KB stdout cap cannot clip them.
+const REMOTE_STATUS_CHUNK = 2700
+const REMOTE_STATUS_MAX_BYTES = 1024 * 1024
+
+function isSafeRemotePath(path) {
+  const s = String(path || '')
+  if (!s.startsWith('/') || s.length > 4096) return false
+  if (s.split('/').includes('..')) return false
+  if (/[\0\r\n'"`$\\;|&<>(){}]/.test(s)) return false
+  return true
+}
+
+// Starts by clearing this user's temp files older than two minutes, left
+// behind when an earlier read was cut off before it could delete its own.
+function remoteStatusCaptureCommand(bin, kind) {
+  const write = binCommand(bin, 'status --json', kind)
+  const sweep = `find "\${TMPDIR:-/tmp}" -maxdepth 1 -name 'hermes-tailscale-status.*' -user "$(id -u)" -mmin +2 -exec rm -f {} + 2>/dev/null;`
+  return `${sweep} umask 077 && f=$(mktemp "\${TMPDIR:-/tmp}/hermes-tailscale-status.XXXXXX") && ${write} > "$f"; st=$?; if [ -n "\${f:-}" ] && [ -f "$f" ]; then bytes=$(wc -c < "$f" | tr -d '[:space:]'); printf '%s\\n%s\\n' "$bytes" "$f"; fi; exit $st`
+}
+
+function parseRemoteStatusCapture(stdout) {
+  const lines = String(stdout || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+  if (lines.length < 2) return null
+  const path = lines[lines.length - 1]
+  const sizeLine = lines[lines.length - 2]
+  if (!/^\d+$/.test(sizeLine)) return null
+  const size = Number(sizeLine)
+  if (!Number.isFinite(size) || size < 0 || size > Number.MAX_SAFE_INTEGER) return null
+  if (!isSafeRemotePath(path)) return null
+  return { path, size }
+}
+
+function remoteStatusChunkCommand(path, offset, count) {
+  const start = Number(offset)
+  const n = Number(count)
+  if (!Number.isInteger(start) || start < 1) return ''
+  if (!Number.isInteger(n) || n < 1 || n > REMOTE_STATUS_CHUNK) return ''
+  if (!isSafeRemotePath(path)) return ''
+  return `tail -c +${start} ${quoteShell(path, 'linux')} | head -c ${n} | base64`
+}
+
+function remoteStatusRemoveCommand(path) {
+  if (!isSafeRemotePath(path)) return ''
+  return `rm -f ${quoteShell(path, 'linux')}`
+}
+
+function remotePartialStatusMessage(kind) {
+  const head = 'The connected host returned only part of the Tailscale status (Hermes caps a shell response at about 4 KB).'
+  if (kind === 'windows') {
+    return `${head} A remote Windows gateway cannot stream the full status. Use the local connection, or a Linux or macOS gateway.`
+  }
+  return `${head} Reading it in chunks also failed on that host.`
 }
 
 function classifyCliError(result) {
@@ -954,6 +1069,12 @@ function sendStatusText(job) {
 
 // --- runtime ---
 
+// Shell-host OS, keyed by connection id. Cleared, with cachedBin, when the
+// desktop switches gateways — the binary path depends on that host's OS.
+let seenConnectionKey
+let cachedShellHostKind = ''
+let shellHostProbe = null
+
 function tap() {
   if (typeof haptic === 'function') haptic('tap')
 }
@@ -991,6 +1112,141 @@ function desktopConnectionId() {
   }
 }
 
+// 'local' covers a local gateway and an unknown connection (null). Anything
+// else is the remote connection id.
+function currentConnectionKey() {
+  const id = desktopConnectionId()
+  return isRemoteConnection(id) ? id : 'local'
+}
+
+function observeConnection() {
+  const key = currentConnectionKey()
+  if (seenConnectionKey !== undefined && seenConnectionKey !== key) {
+    cachedShellHostKind = ''
+    cachedBin = null
+  }
+  seenConnectionKey = key
+  return key
+}
+
+// OS of the machine shell.exec runs on. Local and unknown keep the desktop
+// OS and do not probe. A remote id is probed once (`uname -s`) and reused
+// until the connection id changes.
+// Overlapping callers share one probe. An unclear answer (timeout, error,
+// empty output) is not cached: this call fails and the next one probes again.
+async function shellHostKind() {
+  const key = observeConnection()
+  if (key === 'local') return platformKind()
+  if (cachedShellHostKind) return cachedShellHostKind
+  if (!shellHostProbe || shellHostProbe.key !== key) {
+    const promise = runShell('uname -s').then(
+      result => result,
+      error => {
+        if (/gateway unavailable/i.test(errorMessage(error, ''))) throw error
+        return null
+      }
+    )
+    const clear = () => {
+      if (shellHostProbe && shellHostProbe.promise === promise) shellHostProbe = null
+    }
+    shellHostProbe = { key, promise }
+    promise.then(clear, clear)
+  }
+  const probed = await shellHostProbe.promise
+  if (observeConnection() !== key) return shellHostKind()
+  const kind = classifyShellHost(probed)
+  if (!kind) throw new Error('Could not tell which OS the connected host runs.')
+  cachedShellHostKind = kind
+  return kind
+}
+
+// Desktop terminal commands (ssh, file send) run on this machine. On a remote
+// connection the shared cachedBin was found on the gateway, so use the bare
+// CLI name from this machine's PATH instead.
+async function terminalBin(kind) {
+  if (currentConnectionKey() !== 'local') return { bin: binaryCandidates(kind)[0], kind: 'ok' }
+  return probeBinary(kind)
+}
+
+const REMOTE_SEND_MESSAGE = 'Sending a file needs the in-app terminal when Hermes is connected to a remote gateway.'
+
+// Only used on remote connections, so the messages name the connected host.
+function statusCliFailure(result) {
+  const why = classifyCliError(result)
+  if (why === 'missing') {
+    cachedBin = null
+    return { kind: 'missing', message: 'Tailscale is not installed on the connected host.' }
+  }
+  if (why === 'daemon') {
+    return { kind: 'daemon', message: 'Tailscale is installed on the connected host, but its daemon is not running.' }
+  }
+  const err = String((result && result.stderr) || '').trim()
+  return { kind: 'error', message: err || 'tailscale status failed' }
+}
+
+function concatBytes(parts) {
+  let total = 0
+  for (let i = 0; i < parts.length; i += 1) total += parts[i].length
+  const out = new Uint8Array(total)
+  let offset = 0
+  for (let i = 0; i < parts.length; i += 1) {
+    out.set(parts[i], offset)
+    offset += parts[i].length
+  }
+  return out
+}
+
+// Full `tailscale status --json` from a remote POSIX gateway. Returns
+// `{ text }` for the caller to validate, or `{ snapshot }` when the CLI
+// itself failed (daemon down, binary missing). When no temp file could be
+// made, or a chunk cannot be read (missing tool, clipped output), it falls
+// back to one inline response. The temp file is removed whenever a path
+// came back, including on failure.
+async function readRemotePosixStatus(bin, kind) {
+  let info = null
+  try {
+    const capture = await runShell(remoteStatusCaptureCommand(bin, kind))
+    info = parseRemoteStatusCapture(capture && capture.stdout)
+    if (!info) return readInlineStatus(bin, kind)
+    if (!capture || capture.code) return { snapshot: statusCliFailure(capture) }
+    if (info.size > REMOTE_STATUS_MAX_BYTES) {
+      return { snapshot: { kind: 'error', message: 'Tailscale status on the connected host is too large to read.' } }
+    }
+    const parts = []
+    for (let offset = 1; offset <= info.size; offset += REMOTE_STATUS_CHUNK) {
+      const count = Math.min(REMOTE_STATUS_CHUNK, info.size - offset + 1)
+      const command = remoteStatusChunkCommand(info.path, offset, count)
+      const chunk = command ? await runShell(command) : null
+      const bytes = chunk && !chunk.code ? base64ToBytes(chunk.stdout) : null
+      if (!bytes || bytes.length !== count) return readInlineStatus(bin, kind)
+      parts.push(bytes)
+    }
+    return { text: new TextDecoder().decode(concatBytes(parts)) }
+  } finally {
+    const command = info ? remoteStatusRemoveCommand(info.path) : ''
+    if (command) {
+      try {
+        await runShell(command)
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+}
+
+// One inline response: the only route on a remote Windows gateway and the
+// fallback on POSIX. A clipped status gets an honest error instead of the
+// desktop cache-path message (that file is not on the connected host).
+async function readInlineStatus(bin, kind) {
+  const inline = await runShell(binCommand(bin, 'status --json', kind))
+  if (inline && inline.code) return { snapshot: statusCliFailure(inline) }
+  const text = String((inline && inline.stdout) || '')
+  if (!looksCompleteJson(text.trim())) {
+    return { snapshot: { kind: 'error', message: remotePartialStatusMessage(kind) } }
+  }
+  return { text }
+}
+
 async function resolvePluginsRoot() {
   if (cachedRoot) return cachedRoot
   const bridge = desktop()
@@ -1021,6 +1277,9 @@ async function resolveOutPath(kind) {
 function removeCacheFile() {
   const path = cachedOutPath
   if (!path) return
+  // The desktop cache is only written on a local connection; a remote shell
+  // would be deleting this path on a different machine.
+  if (currentConnectionKey() !== 'local') return
   try {
     runShell(removeCacheArtifactsCommand(path, platformKind())).catch(() => {})
   } catch {
@@ -1118,7 +1377,17 @@ async function loadSnapshot() {
   if (gateway && gateway !== 'open') {
     return { kind: 'gateway', message: 'Hermes is not connected, so the Tailscale CLI cannot run.' }
   }
-  const kind = platformKind()
+  const connectionKey = currentConnectionKey()
+  let kind
+  try {
+    kind = await shellHostKind()
+  } catch (error) {
+    const message = errorMessage(error, 'Could not run tailscale status')
+    if (/gateway unavailable/i.test(message)) {
+      return { kind: 'gateway', message: 'Hermes is not connected, so the Tailscale CLI cannot run.' }
+    }
+    return { kind: 'error', message }
+  }
   const probed = await probeBinary(kind)
   if (probed.kind === 'gateway') {
     return { kind: 'gateway', message: 'Hermes is not connected, so the Tailscale CLI cannot run.' }
@@ -1136,38 +1405,48 @@ async function loadSnapshot() {
     return { kind: 'error', message: 'Could not run the Tailscale CLI.' }
   }
 
-  const outPath = await resolveOutPath(kind)
   const connectionId = desktopConnectionId()
+  const remote = connectionKey !== 'local'
   let rawText = ''
-  let cachePath = outPath
+  let cachePath = ''
   let cacheReason = 'bridge'
   let cacheDetail = ''
   try {
-    if (outPath) {
-      const cycle = await readStatusViaCache(probed.bin, outPath, kind)
-      if (cycle.snapshot) return cycle.snapshot
-      rawText = cycle.text
-      cacheReason = cycle.reason
-      cacheDetail = cycle.detail
-    }
-    if (!looksCompleteJson(rawText)) {
-      // The inline route returns the last 4,000 chars of stdout, which is
-      // never authoritative for a tailnet whose status exceeds 4 KB — it is
-      // only accepted below when it happens to be one complete JSON object.
-      const inline = await runShell(binCommand(probed.bin, 'status --json', kind))
-      if (inline && inline.code) {
-        const why = classifyCliError(inline)
-        if (why === 'missing') {
-          cachedBin = null
-          return { kind: 'missing', message: 'Tailscale is not installed on this machine.' }
-        }
-        if (why === 'daemon') {
-          return { kind: 'daemon', message: 'Tailscale is installed, but the daemon is not running.' }
-        }
-        const err = String((inline && inline.stderr) || '').trim()
-        return { kind: 'error', message: err || 'tailscale status failed' }
+    if (remote) {
+      const got = kind === 'windows'
+        ? await readInlineStatus(probed.bin, kind)
+        : await readRemotePosixStatus(probed.bin, kind)
+      if (got.snapshot) return got.snapshot
+      rawText = got.text || ''
+    } else {
+      const outPath = await resolveOutPath(kind)
+      cachePath = outPath
+      if (outPath) {
+        const cycle = await readStatusViaCache(probed.bin, outPath, kind)
+        if (cycle.snapshot) return cycle.snapshot
+        rawText = cycle.text
+        cacheReason = cycle.reason
+        cacheDetail = cycle.detail
       }
-      rawText = String((inline && inline.stdout) || '')
+      if (!looksCompleteJson(rawText)) {
+        // The inline route returns the last 4,000 chars of stdout, which is
+        // never authoritative for a tailnet whose status exceeds 4 KB — it is
+        // only accepted below when it happens to be one complete JSON object.
+        const inline = await runShell(binCommand(probed.bin, 'status --json', kind))
+        if (inline && inline.code) {
+          const why = classifyCliError(inline)
+          if (why === 'missing') {
+            cachedBin = null
+            return { kind: 'missing', message: 'Tailscale is not installed on this machine.' }
+          }
+          if (why === 'daemon') {
+            return { kind: 'daemon', message: 'Tailscale is installed, but the daemon is not running.' }
+          }
+          const err = String((inline && inline.stderr) || '').trim()
+          return { kind: 'error', message: err || 'tailscale status failed' }
+        }
+        rawText = String((inline && inline.stdout) || '')
+      }
     }
   } catch (error) {
     const message = errorMessage(error, 'Could not run tailscale status')
@@ -1177,8 +1456,11 @@ async function loadSnapshot() {
     return { kind: 'error', message }
   }
 
+  // The desktop switched gateways mid-read: this status belongs to the old one.
+  if (currentConnectionKey() !== connectionKey) return loadSnapshot()
   const trimmed = rawText.trim()
   if (!looksCompleteJson(trimmed)) {
+    if (remote) return { kind: 'error', message: remotePartialStatusMessage(kind) }
     return { kind: 'error', message: cacheFailureMessage(cachePath, cacheReason, cacheDetail, connectionId) }
   }
   let parsed
@@ -1282,7 +1564,12 @@ function say(message) {
 }
 
 async function runCli(args) {
-  const kind = platformKind()
+  let kind
+  try {
+    kind = await shellHostKind()
+  } catch (error) {
+    return { ok: false, error: 'host', stdout: '', stderr: errorMessage(error, 'Could not reach the connected host.'), code: 1, kind: '' }
+  }
   const probed = await probeBinary(kind)
   if (!probed.bin) return { ok: false, error: probed.kind || 'missing', stdout: '', stderr: '', code: 1, kind }
   const result = await runShell(binCommand(probed.bin, args, kind))
@@ -1331,7 +1618,7 @@ async function pingRow(row) {
   }
   $ping.set({ ...$ping.get(), [row.id]: { state: 'busy', text: 'pinging…' } })
   try {
-    const kind = platformKind()
+    const kind = await shellHostKind()
     const probed = await probeBinary(kind)
     if (!probed.bin) {
       $ping.set({ ...$ping.get(), [row.id]: { state: 'err', text: 'no CLI' } })
@@ -1367,20 +1654,25 @@ function servePort() {
 async function probeLocalPort(port) {
   const n = parsePort(port)
   if (!n) return 'closed'
-  try {
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 3000)
+  // The renderer fetch reaches this desktop, which is only the serving host
+  // on a local connection.
+  if (currentConnectionKey() === 'local') {
     try {
-      await fetch(`http://127.0.0.1:${n}/`, { mode: 'no-cors', cache: 'no-store', signal: controller.signal })
-      return 'open'
-    } finally {
-      clearTimeout(timer)
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 3000)
+      try {
+        await fetch(`http://127.0.0.1:${n}/`, { mode: 'no-cors', cache: 'no-store', signal: controller.signal })
+        return 'open'
+      } finally {
+        clearTimeout(timer)
+      }
+    } catch {
+      /* refused, blocked, or timed out */
     }
-  } catch {
-    /* refused, blocked, or timed out */
   }
   try {
-    const result = await runShell(portProbeCommand(n, platformKind()))
+    const kind = await shellHostKind()
+    const result = await runShell(portProbeCommand(n, kind))
     return classifyPortProbe(result)
   } catch {
     return 'unknown'
@@ -1422,7 +1714,13 @@ async function resetServe() {
 }
 
 async function setExitNode(name) {
-  const kind = platformKind()
+  let kind
+  try {
+    kind = await shellHostKind()
+  } catch (error) {
+    say(errorMessage(error, 'Could not reach the connected host.'))
+    return
+  }
   const probed = await probeBinary(kind)
   if (!probed.bin) {
     say('Tailscale CLI is not available.')
@@ -1447,7 +1745,14 @@ async function switchAccount(id) {
     say('That account id is not safe to pass to the CLI.')
     return
   }
-  const kind = platformKind()
+  let kind
+  try {
+    kind = await shellHostKind()
+  } catch (error) {
+    say(errorMessage(error, 'Could not reach the connected host.'))
+    return
+  }
+  const key = currentConnectionKey()
   const probed = await probeBinary(kind)
   if (!probed.bin) return
   const result = await runShell(binCommand(probed.bin, `switch ${quoteShell(id, kind)}`, kind))
@@ -1455,7 +1760,7 @@ async function switchAccount(id) {
     say(String((result.stderr || result.stdout || 'switch failed')).trim())
     return
   }
-  cachedBin = probed.bin
+  if (currentConnectionKey() === key) cachedBin = probed.bin
   say(`Switched to ${id}`)
   refresh()
 }
@@ -1524,7 +1829,8 @@ async function sendFilePty(bin, kind, filePath, dest) {
   const session = await bridge.terminal.start({ cols: 100, rows: 24 })
   const id = session && session.id
   if (!id) {
-    await sendFileShell(bin, kind, filePath, dest)
+    if (currentConnectionKey() !== 'local') finishSend({ state: 'err', text: REMOTE_SEND_MESSAGE })
+    else await sendFileShell(bin, kind, filePath, dest)
     return
   }
   const open = $send.get()
@@ -1573,7 +1879,8 @@ async function sendFilePty(bin, kind, filePath, dest) {
     const attached = await bridge.terminal.attach(id)
     if (!attached) {
       stopSendPty()
-      await sendFileShell(bin, kind, filePath, dest)
+      if (currentConnectionKey() !== 'local') finishSend({ state: 'err', text: REMOTE_SEND_MESSAGE })
+      else await sendFileShell(bin, kind, filePath, dest)
       return
     }
   }
@@ -1618,8 +1925,24 @@ async function sendFile(row) {
     say('That file path is not safe to pass to the CLI.')
     return
   }
-  const kind = platformKind()
-  const probed = await probeBinary(kind)
+  const bridge = desktop()
+  const usePty = !!(bridge && bridge.terminal && typeof bridge.terminal.start === 'function')
+  // bridge.terminal runs on this desktop, so a PTY send keeps the desktop OS.
+  // Without it the file would have to be read by the connected host, which
+  // only works when that host is this machine.
+  let kind
+  let probed
+  if (usePty) {
+    kind = platformKind()
+    probed = await terminalBin(kind)
+  } else {
+    if (currentConnectionKey() !== 'local') {
+      say(REMOTE_SEND_MESSAGE)
+      return
+    }
+    kind = platformKind()
+    probed = await probeBinary(kind)
+  }
   if (!probed.bin) return
   const dest = `${target}:`
   const name = pathBase(path)
@@ -1640,8 +1963,7 @@ async function sendFile(row) {
     text: `Sending ${name}`
   })
   try {
-    const bridge = desktop()
-    if (bridge && bridge.terminal && typeof bridge.terminal.start === 'function') {
+    if (usePty) {
       await sendFilePty(probed.bin, kind, path, dest)
       return
     }
@@ -1779,6 +2101,7 @@ async function loadTerminal() {
   if (xtermLoad) return xtermLoad
   xtermLoad = (async () => {
     injectXtermCss()
+    // Local xterm.js sits next to plugin.js on this desktop, not the gateway.
     const kind = platformKind()
     const root = await resolvePluginsRoot()
     const errors = []
@@ -1936,8 +2259,10 @@ async function openSsh(row, user) {
       unsubExit && unsubExit()
       if (sshReplay.id === id) sshReplay = { id: '', chunks: [], onChunk: null }
     }
+    // The ssh line is typed into the desktop PTY, so quoting follows this
+    // machine and so does the binary.
     const kind = platformKind()
-    const probed = await probeBinary(kind)
+    const probed = await terminalBin(kind)
     const command = sshCommand(row, probed.bin, kind, user)
     if (!command) {
       say('Could not build an ssh command.')
@@ -2377,6 +2702,7 @@ function SshOverlay() {
           return
         }
       }
+      // windowsMode follows the desktop PTY (conpty), not the gateway OS.
       const kind = platformKind()
       const windows = kind === 'windows'
       term = new Terminal({
@@ -3602,12 +3928,14 @@ export default {
 
 export const __test = {
   platformKind,
+  classifyShellHost,
   quoteShell,
   joinPath,
   xtermSources,
   integrityMatches,
   wrapXtermModule,
   bytesToBase64,
+  base64ToBytes,
   binaryCandidates,
   binCommand,
   statusRedirectCommand,
@@ -3622,6 +3950,11 @@ export const __test = {
   cacheReadErrorReason,
   cacheReadVerdict,
   cacheFailureMessage,
+  remoteStatusCaptureCommand,
+  parseRemoteStatusCapture,
+  remoteStatusChunkCommand,
+  remoteStatusRemoveCommand,
+  remotePartialStatusMessage,
   cacheReasonText,
   looksCompleteJson,
   firstLine,

@@ -110,7 +110,9 @@ Your Hermes Desktop  →  Tailscale CLI on this machine  →  your tailnet
 
 No Tailscale API key. No account token stored by the plugin. SSH usernames are asked per connection and not remembered.
 
-**The status cache.** `tailscale status --json` is longer than the 4k `shell.exec` stdout cap, so the plugin writes it to `status-cache.json` next to `plugin.js` and reads it back. That file holds what `tailscale status` shows: device names, tailnet IPs, owners, tags, OS, and last-seen times. It is rewritten on every poll (8s on the page, 60s otherwise), created `0600` on macOS and Linux, relies on the user-only profile ACL on Windows, and is deleted when the plugin unloads or Hermes quits cleanly. If Hermes crashes it stays until the next run overwrites it. Delete it by hand any time; the plugin recreates it.
+**The status cache.** On a local gateway, `tailscale status --json` is longer than the 4k `shell.exec` stdout cap, so the plugin writes it to `status-cache.json` next to `plugin.js` and reads it back. That file holds what `tailscale status` shows: device names, tailnet IPs, owners, tags, OS, and last-seen times. It is rewritten on every poll (8s on the page, 60s otherwise), created `0600` on macOS and Linux, relies on the user-only profile ACL on Windows, and is deleted when the plugin unloads or Hermes quits cleanly. If Hermes crashes it stays until the next run overwrites it. Delete it by hand any time; the plugin recreates it.
+
+A remote gateway does not use that desktop file. On Linux and macOS the plugin writes the status to a short-lived `0600` temp file on the gateway, reads it back in chunks, and deletes the file (leftovers older than two minutes are swept on the next read). A remote Windows gateway can only load a status that fits in one shell response.
 
 - **Local CLI.** Roster, ping, serve, exit node, account switch, and Taildrop all exec the installed client.
 - **Confirm before write.** Serve, exit node, account switch, and file send ask first.
@@ -136,9 +138,9 @@ Each tagged release lists the Hermes Desktop and Tailscale versions it was teste
 ## Limits
 
 - The serve port check only proves a listener exists. It does not prove that listener is Hermes.
-- A remote gateway shows *that* machine's tailnet, not the laptop in front of you.
+- A remote gateway shows *that* machine's tailnet, not the laptop in front of you. Linux and macOS gateways stream the full status back; a remote Windows gateway only loads a status that fits in one shell response.
 - Ping, serve, and other `shell.exec` calls still have a 30 second cap. SSH and file send do not, because they use a PTY.
-- One Taildrop send at a time.
+- One Taildrop send at a time. On a remote gateway, file send needs the in-app terminal and uses the `tailscale` on this machine's PATH.
 - The SSH overlay is xterm, not a full Desktop terminal app. Fine for a shell, `apt`, and passwords. A poor place to live in tmux all day.
 - xterm is fetched at runtime unless you drop a copy next to `plugin.js`. Offline first launch with no local copy falls back to a plain log.
 
