@@ -489,12 +489,25 @@ function isSafeRemotePath(path) {
   return true
 }
 
-// Starts by clearing this user's temp files older than two minutes, left
-// behind when an earlier read was cut off before it could delete its own.
+// Lists this user's temp files older than two minutes, left behind when an
+// earlier read was cut off before it could delete its own. Only lists them:
+// Hermes' shell.exec safety check rejects `find ... -exec rm` and
+// `find ... -delete`, so each path is removed on its own with
+// remoteStatusRemoveCommand().
+function remoteStatusSweepCommand() {
+  return `find "\${TMPDIR:-/tmp}" -maxdepth 1 -name 'hermes-tailscale-status.*' -user "$(id -u)" -mmin +2 -print 2>/dev/null`
+}
+
+function parseRemoteStatusSweep(stdout) {
+  return String(stdout || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(path => isSafeRemotePath(path) && /^hermes-tailscale-status\.[^/]+$/.test(path.split('/').pop()))
+}
+
 function remoteStatusCaptureCommand(bin, kind) {
   const write = binCommand(bin, 'status --json', kind)
-  const sweep = `find "\${TMPDIR:-/tmp}" -maxdepth 1 -name 'hermes-tailscale-status.*' -user "$(id -u)" -mmin +2 -exec rm -f {} + 2>/dev/null;`
-  return `${sweep} umask 077 && f=$(mktemp "\${TMPDIR:-/tmp}/hermes-tailscale-status.XXXXXX") && ${write} > "$f"; st=$?; if [ -n "\${f:-}" ] && [ -f "$f" ]; then bytes=$(wc -c < "$f" | tr -d '[:space:]'); printf '%s\\n%s\\n' "$bytes" "$f"; fi; exit $st`
+  return `umask 077 && f=$(mktemp "\${TMPDIR:-/tmp}/hermes-tailscale-status.XXXXXX") && ${write} > "$f"; st=$?; if [ -n "\${f:-}" ] && [ -f "$f" ]; then bytes=$(wc -c < "$f" | tr -d '[:space:]'); printf '%s\\n%s\\n' "$bytes" "$f"; fi; exit $st`
 }
 
 function parseRemoteStatusCapture(stdout) {
@@ -1252,6 +1265,19 @@ function concatBytes(parts) {
   return out
 }
 
+// Best-effort removal of temp files left by earlier remote reads.
+async function sweepRemoteStatusFiles() {
+  try {
+    const listed = await runShell(remoteStatusSweepCommand())
+    for (const path of parseRemoteStatusSweep(listed && listed.stdout)) {
+      const command = remoteStatusRemoveCommand(path)
+      if (command) await runShell(command)
+    }
+  } catch {
+    /* best effort */
+  }
+}
+
 // Full `tailscale status --json` from a remote POSIX gateway. Returns
 // `{ text }` for the caller to validate, or `{ snapshot }` when the CLI
 // itself failed (daemon down, binary missing). When no temp file could be
@@ -1260,6 +1286,7 @@ function concatBytes(parts) {
 // came back, including on failure.
 async function readRemotePosixStatus(bin, kind) {
   let info = null
+  await sweepRemoteStatusFiles()
   try {
     const capture = await runShell(remoteStatusCaptureCommand(bin, kind))
     info = parseRemoteStatusCapture(capture && capture.stdout)
@@ -3669,6 +3696,8 @@ export const __test = {
   cacheReadErrorReason,
   cacheReadVerdict,
   cacheFailureMessage,
+  remoteStatusSweepCommand,
+  parseRemoteStatusSweep,
   remoteStatusCaptureCommand,
   parseRemoteStatusCapture,
   remoteStatusChunkCommand,
