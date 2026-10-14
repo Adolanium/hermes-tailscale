@@ -41,6 +41,8 @@ export const names = [
   'cacheReadErrorReason',
   'cacheReasonText',
   'cacheFailureMessage',
+  'remoteStatusSweepCommand',
+  'parseRemoteStatusSweep',
   'remoteStatusCaptureCommand',
   'parseRemoteStatusCapture',
   'remoteStatusChunkCommand',

@@ -517,9 +517,33 @@ test('remote CLI failures name the connected host', async () => {
   assert.match(result.message, /connected host/)
 })
 
-test('capture command sweeps old temp files first and still runs under sh', () => {
-  const capture = h.remoteStatusCaptureCommand({ path: 'tailscale' }, 'linux')
-  assert.match(capture, /^find "\$\{TMPDIR:-\/tmp\}" -maxdepth 1 -name 'hermes-tailscale-status\.\*' -user "\$\(id -u\)" -mmin \+2 -exec rm -f \{\} \+ 2>\/dev\/null;/)
+test('stale temp files are listed, then removed one at a time', async () => {
+  const sweep = h.remoteStatusSweepCommand()
+  assert.equal(sweep, `find "\${TMPDIR:-/tmp}" -maxdepth 1 -name 'hermes-tailscale-status.*' -user "$(id -u)" -mmin +2 -print 2>/dev/null`)
+  assert.doesNotMatch(sweep, /-exec|-delete/)
+  assert.doesNotMatch(h.remoteStatusCaptureCommand({ path: 'tailscale' }, 'linux'), /\bfind\b/)
+  assert.deepEqual(
+    [...h.parseRemoteStatusSweep("/tmp/hermes-tailscale-status.a1\n\n/tmp/other.b2\n/tmp/hermes-tailscale-status.x;rm -rf ~\nrelative/hermes-tailscale-status.c3\n/tmp/../hermes-tailscale-status.d4\r\n/var/tmp/hermes-tailscale-status.e5\r\n")],
+    ['/tmp/hermes-tailscale-status.a1', '/var/tmp/hermes-tailscale-status.e5']
+  )
+
+  const r = bootRuntime({
+    connectionId: 'gw',
+    request: command => {
+      if (command === 'uname -s') return { code: 0, stdout: 'Linux\n' }
+      if (command.startsWith('find ')) return { code: 0, stdout: '/tmp/hermes-tailscale-status.old1\n/tmp/hermes-tailscale-status.old2\n' }
+      if (command.includes('mktemp')) return { code: 1, stdout: '0\n/tmp/hermes-tailscale-status.d\n', stderr: 'failed to connect to local tailscaled' }
+      return { code: 0, stdout: '' }
+    }
+  })
+  await r.loadSnapshot()
+  const find = r.commands.findIndex(command => command.startsWith('find '))
+  const capture = r.commands.findIndex(command => command.includes('mktemp'))
+  assert.ok(find >= 0 && find < capture)
+  assert.deepEqual(r.commands.slice(find + 1, capture), [
+    "rm -f '/tmp/hermes-tailscale-status.old1'",
+    "rm -f '/tmp/hermes-tailscale-status.old2'"
+  ])
 })
 
 test('removeCacheFile does nothing on a remote connection', async () => {
