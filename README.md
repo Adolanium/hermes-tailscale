@@ -263,4 +263,4 @@ the dependency lockfile. CI verifies them with
 `npx playwright install chromium` and `npm run test:browser`. The test uses the
 packaged terminal with external requests blocked and checks rendering, keyboard
 input, resizing, and disposal. Catalog packaging
-releases use `catalog-v0.0.6` and are not marked as the latest standalone release.
+releases use `catalog-v0.0.7` and are not marked as the latest standalone release.
