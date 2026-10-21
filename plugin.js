@@ -1129,7 +1129,15 @@ function desktop() {
 }
 
 async function runShell(command) {
-  return host.request('shell.exec', { command })
+  try {
+    return await host.request('shell.exec', { command })
+  } catch (error) {
+    if (!/\binvalid_params\b/.test(errorMessage(error, ''))) throw error
+    const signal = host.state && host.state.activeSessionId
+    const sessionId = signal && typeof signal.get === 'function' ? signal.get() : null
+    if (!sessionId) throw new Error('Open a local Hermes chat, then refresh Tailscale. This gateway requires a session for shell commands.')
+    return host.request('shell.exec', { command, session_id: sessionId })
+  }
 }
 
 // 'local' (or unknown/null) means the shell runs on this machine; any other
@@ -1354,12 +1362,14 @@ async function readCacheFile(path) {
 async function probeBinary(kind) {
   if (cachedBin) return { bin: cachedBin, error: null, kind: 'ok' }
   const failures = []
+  let lastError = null
   for (const bin of binaryCandidates(kind)) {
     try {
       const result = await runShell(binCommand(bin, 'version --json', kind))
       if (!result || result.code) {
         const why = classifyCliError(result)
         failures.push(why)
+        if (why === 'failed') lastError = new Error(firstLine(result && (result.stderr || result.stdout), 160) || 'Could not run the Tailscale CLI.')
         if (why === 'daemon' || why === 'denied') return { bin: null, error: result, kind: why }
         continue
       }
@@ -1368,11 +1378,12 @@ async function probeBinary(kind) {
     } catch (error) {
       const message = errorMessage(error, '')
       if (/gateway unavailable/i.test(message)) return { bin: null, error: { message }, kind: 'gateway' }
+      lastError = error
       failures.push('failed')
     }
   }
-  const kindOut = failures.includes('daemon') ? 'daemon' : failures.includes('denied') ? 'denied' : 'missing'
-  return { bin: null, error: null, kind: kindOut }
+  const kindOut = failures.includes('daemon') ? 'daemon' : failures.includes('denied') ? 'denied' : failures.includes('failed') ? 'failed' : 'missing'
+  return { bin: null, error: lastError, kind: kindOut }
 }
 
 // One atomic write → read cycle. Cache failures carry a reason so inline
@@ -1449,7 +1460,7 @@ async function loadSnapshot() {
     return { kind: 'denied', message: 'This user cannot talk to the local Tailscale daemon.' }
   }
   if (!probed.bin) {
-    return { kind: 'error', message: 'Could not run the Tailscale CLI.' }
+    return { kind: 'error', message: errorMessage(probed.error, 'Could not run the Tailscale CLI.') }
   }
 
   const connectionId = desktopConnectionId()
