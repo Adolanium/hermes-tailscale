@@ -3,9 +3,11 @@ import test from 'node:test'
 import vm from 'node:vm'
 import { source } from './helpers.mjs'
 
-function runtime(request, sessionId = 'local-chat') {
+function runtime(request, sessionId = 'local-chat', focusedSessionId) {
+  const state = { activeSessionId: { get: () => sessionId } }
+  if (arguments.length > 2) state.focusedSessionId = { get: () => focusedSessionId }
   const context = vm.createContext({
-    host: { request, state: { activeSessionId: { get: () => sessionId } } },
+    host: { request, state },
     navigator: { platform: 'MacIntel' }
   })
   const start = source.indexOf('const TAILDROP = {')
@@ -34,6 +36,62 @@ test('canonical shell retry supplies the active session after a missing-paramete
     { command: 'tailscale version --json' },
     { command: 'tailscale version --json', session_id: 'local-chat' }
   ])
+})
+
+test('focused chat is the session id, with the primary only as a fallback', async () => {
+  const calls = []
+  const run = runtime(async (method, params) => {
+    calls.push(params.session_id || '')
+    if (!params.session_id) throw new Error('JsonRpcGatewayError: invalid_params')
+    return { code: 0, stdout: '{}' }
+  }, 'primary-chat', 'local-focused')
+  assert.equal((await run.runShell('tailscale version --json')).code, 0)
+  assert.deepEqual(calls, ['', 'local-focused'])
+
+  const fallback = []
+  const primary = runtime(async (method, params) => {
+    fallback.push(params.session_id || '')
+    if (!params.session_id) throw new Error('invalid_params')
+    return { code: 0 }
+  }, 'primary-chat', null)
+  assert.equal((await primary.runShell('tailscale version --json')).code, 0)
+  assert.deepEqual(fallback, ['', 'primary-chat'])
+})
+
+test('prose invalid params retries with the session', async () => {
+  const calls = []
+  const run = runtime(async (method, params) => {
+    calls.push(params.session_id || '')
+    if (!params.session_id) throw new Error('Invalid params')
+    return { code: 0, stdout: '{}' }
+  })
+  assert.equal((await run.runShell('tailscale version --json')).code, 0)
+  assert.deepEqual(calls, ['', 'local-chat'])
+})
+
+test('structured invalid_params reason retries when the message does not say so', async () => {
+  const calls = []
+  const run = runtime(async (method, params) => {
+    calls.push(params.session_id || '')
+    if (!params.session_id) {
+      const error = new Error('the client and the Hermes backend are out of sync')
+      error.data = { reason: 'invalid_params' }
+      throw error
+    }
+    return { code: 0 }
+  })
+  assert.equal((await run.runShell('tailscale version --json')).code, 0)
+  assert.deepEqual(calls, ['', 'local-chat'])
+})
+
+test('extra-inputs refusal is surfaced and not retried with a session', async () => {
+  let calls = 0
+  const run = runtime(async () => {
+    calls += 1
+    throw new Error('invalid params for shell.exec: session_id: Extra inputs are not permitted')
+  })
+  await assert.rejects(run.runShell('tailscale version --json'), /Extra inputs/)
+  assert.equal(calls, 1)
 })
 
 test('legacy shell success does not add unsupported session parameters', async () => {

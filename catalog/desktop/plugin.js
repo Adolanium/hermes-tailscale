@@ -1164,14 +1164,44 @@ function desktop() {
   return typeof window !== 'undefined' ? window.hermesDesktop : null
 }
 
+// Canonical shell.exec refuses { command } with invalid_params until it has a
+// session_id. Older gateways accept the bare call, so that stays first.
+// The focused chat is the id that works. activeSessionId is only the primary,
+// so a focused tile is missed if that is the only read.
+function shellSessionId() {
+  const read = signal => {
+    try {
+      const value = signal && typeof signal.get === 'function' ? signal.get() : ''
+      return typeof value === 'string' && value ? value : ''
+    } catch {
+      return ''
+    }
+  }
+  const state = host && host.state
+  if (!state) return ''
+  return read(state.focusedSessionId) || read(state.activeSessionId)
+}
+
+// Missing-session refusals use the code invalid_params, or the same words
+// with a space ("Invalid params"). "Extra inputs" is an older gateway
+// rejecting session_id, which is the opposite problem and must not add one.
+function shellMissingSession(error) {
+  const data = error && error.data
+  const reason = data && typeof data.reason === 'string' ? data.reason : ''
+  const text = `${errorMessage(error, '')}\n${reason}`
+  if (/extra[ _]forbidden|extra inputs/i.test(text)) return false
+  return /invalid[ _]params/i.test(text)
+}
+
 async function runShell(command) {
   try {
     return await host.request('shell.exec', { command })
   } catch (error) {
-    if (!/\binvalid_params\b/.test(errorMessage(error, ''))) throw error
-    const signal = host.state && host.state.activeSessionId
-    const sessionId = signal && typeof signal.get === 'function' ? signal.get() : null
-    if (!sessionId) throw new Error('Open a local Hermes chat, then refresh Tailscale. This gateway requires a session for shell commands.')
+    if (!shellMissingSession(error)) throw error
+    const sessionId = shellSessionId()
+    if (!sessionId) {
+      throw new Error('Open a local Hermes chat, then refresh Tailscale. This gateway requires a session for shell commands.')
+    }
     return host.request('shell.exec', { command, session_id: sessionId })
   }
 }
