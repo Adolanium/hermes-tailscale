@@ -76,6 +76,8 @@ Open Hermes and choose **Tailscale** in the sidebar. If it is missing, use **Cmd
 
 You need the Tailscale client installed and logged in on the same machine that runs the Hermes gateway.
 
+On current Hermes, open a local chat, then refresh Tailscale. The CLI runs in that session.
+
 - Windows: `C:\Program Files\Tailscale\tailscale.exe`, or `tailscale` on PATH.
 - macOS: `tailscale` on PATH, `/usr/local/bin/tailscale`, `/opt/homebrew/bin/tailscale`, or the App Store binary at `/Applications/Tailscale.app/Contents/MacOS/Tailscale` (the plugin sets `TAILSCALE_BE_CLI=1` so that launch does not open the GUI).
 - Linux: `tailscale` on PATH, `/usr/bin/tailscale`, `/usr/local/bin/tailscale`, or `/snap/bin/tailscale`.
