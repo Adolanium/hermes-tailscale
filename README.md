@@ -12,7 +12,7 @@
   See who is online, copy an address, SSH in, send a file, or publish this Hermes onto the mesh.
   It talks to the Tailscale CLI you already installed. No admin API token. No cloud round trip.
 
-  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.0.5</sub>
+  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.0.8</sub>
 
   <br /><br />
 
@@ -265,4 +265,4 @@ the dependency lockfile. CI verifies them with
 `npx playwright install chromium` and `npm run test:browser`. The test uses the
 packaged terminal with external requests blocked and checks rendering, keyboard
 input, resizing, and disposal. Catalog packaging
-releases use `catalog-v0.0.6` and are not marked as the latest standalone release.
+releases use `catalog-v0.0.8` and are not marked as the latest standalone release.

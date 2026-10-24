@@ -60,7 +60,7 @@ const PLUGIN_NAME = 'Tailscale'
 // Remote gateways: shell commands follow the connected host's OS (probed once
 // per connection). POSIX hosts stream status JSON in chunks; the desktop
 // cache file is local-only. Desktop terminal commands keep the desktop OS.
-const VERSION = '0.0.6'
+const VERSION = '0.0.8'
 const ROUTE = '/tailscale'
 const PAGE_POLL_MS = 8 * 1000
 const BAR_POLL_MS = 60 * 1000
