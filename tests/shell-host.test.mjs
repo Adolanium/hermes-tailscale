@@ -456,7 +456,7 @@ test('a failed chunk still removes the temp file and falls back to one inline re
   const result = await r.loadSnapshot()
   assert.equal(result.kind, 'ready')
   assert.ok(r.commands.includes(`rm -f '${tempPath}'`))
-  assert.ok(r.commands.some(command => command === "'tailscale' status --json"))
+  assert.ok(r.commands.some(command => command === "'tailscale' status --json --peers=false"))
 })
 
 test('a throw mid-read still removes the temp file', async () => {
@@ -573,4 +573,70 @@ test('the port check skips the desktop fetch on a remote connection', async () =
   await r.probeLocalPort(8642)
   assert.equal(fetched, 0)
   assert.ok(r.commands.some(command => command.includes('8642')))
+})
+
+// The inline fallback never runs the bare `status --json`: on a large tailnet
+// the gateway processes hundreds of KB to return a 4 KB tail that is never
+// complete JSON. `--peers=false` fits and keeps BackendState and Self.
+const bareStatus = command => /status --json(?! --peers=false)/.test(command) && !/serve status|> |mktemp/.test(command)
+
+test('remote POSIX inline fallback asks for this device only', async () => {
+  const bytes = new TextEncoder().encode(smallStatus)
+  const r = bootRuntime({
+    connectionId: 'gw',
+    request: posixGateway({ bytes, chunk: () => ({ code: 127, stdout: '', stderr: 'base64: not found' }), inline: () => ({ code: 0, stdout: smallStatus }) })
+  })
+  const result = await r.loadSnapshot()
+  assert.equal(result.kind, 'ready')
+  assert.deepEqual(r.commands.filter(bareStatus), [])
+  assert.equal(r.commands.filter(command => command.endsWith('status --json --peers=false')).length, 1)
+  assert.equal(result.status.peersUnavailable, 'remote')
+  assert.equal(r.reads(), 0)
+})
+
+test('remote Windows gateway never runs the bare status inline', async () => {
+  const r = bootRuntime({
+    connectionId: 'win-box',
+    request(command) {
+      if (command === 'uname -s') return { code: 1, stdout: '', stderr: 'not recognized' }
+      if (command.includes('status --json --peers=false')) return { code: 0, stdout: smallStatus }
+      if (command.includes('serve status')) return { code: 0, stdout: '{}' }
+      if (command.includes('switch --list')) return { code: 0, stdout: '[]' }
+      if (command.includes('status --json')) return { code: 0, stdout: 'truncated-tail}' }
+      return { code: 0, stdout: '{}' }
+    }
+  })
+  const result = await r.loadSnapshot()
+  assert.equal(result.kind, 'ready')
+  assert.deepEqual(r.commands.filter(bareStatus), [])
+  assert.equal(result.status.peersUnavailable, 'remote')
+  noCmd(r.commands)
+})
+
+test('a local cache write failure falls back to the self-only status', async () => {
+  const r = bootRuntime({
+    connectionId: 'local',
+    nav: { platform: 'MacIntel', userAgent: 'Macintosh' },
+    desktopPluginsRoot: () => '/Users/you/.hermes/desktop-plugins',
+    readFileText: () => assert.fail('the write failed, nothing to read'),
+    request(command) {
+      if (command.includes(' > ')) return { code: 1, stdout: '', stderr: 'mkdir: Permission denied' }
+      if (command.includes('status --json --peers=false')) return { code: 0, stdout: smallStatus }
+      if (command.includes('serve status')) return { code: 0, stdout: '{}' }
+      if (command.includes('switch --list')) return { code: 0, stdout: '[]' }
+      if (command.includes('status --json')) return { code: 0, stdout: 'truncated-tail}' }
+      return { code: 0, stdout: '' }
+    }
+  })
+  const result = await r.loadSnapshot()
+  assert.equal(result.kind, 'ready')
+  assert.deepEqual(r.commands.filter(bareStatus), [])
+  assert.equal(result.status.peersUnavailable, 'cache')
+})
+
+test('the bar chip does not count peers it could not see', () => {
+  const h = loadHelpers()
+  const status = { backend: 'Running', rows: [{ isSelf: true, online: true }], peersUnavailable: 'remote' }
+  assert.equal(h.barLabel({ kind: 'ready', status }), 'ts on')
+  assert.equal(h.barLabel({ kind: 'ready', status: { ...status, peersUnavailable: undefined } }), 'ts 1')
 })

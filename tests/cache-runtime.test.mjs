@@ -5,6 +5,9 @@ import { source } from './helpers.mjs'
 
 const status = JSON.stringify({ BackendState: 'Running', Peer: {}, User: {} })
 const outPath = '/plugins/hermes-tailscale/status-cache.json'
+// The inline fallback asks for this device only: the full status never fits.
+const INLINE = "'tailscale' status --json --peers=false"
+const BARE = "'tailscale' status --json"
 
 // Execute the production cache orchestration, with only the SDK/IPC mocked.
 function runtime({ read, write, inline = status } = {}) {
@@ -16,7 +19,7 @@ function runtime({ read, write, inline = status } = {}) {
         assert.equal(method, 'shell.exec')
         commands.push(command)
         if (command.includes(' > ')) return write ? write() : { code: 0 }
-        if (command === "'tailscale' status --json") return { code: 0, stdout: inline }
+        if (command === INLINE) return { code: 0, stdout: inline }
         return { code: 0, stdout: '{}' }
       }
     },
@@ -52,7 +55,8 @@ for (const [name, broken] of [
     assert.equal(reads, 2)
     assert.equal(r.commands.filter(c => c.includes(' > ')).length, 2)
     assert.equal(r.commands.filter(c => c === `rm -f '${outPath}'`).length, 1)
-    assert.ok(!r.commands.includes("'tailscale' status --json"))
+    assert.ok(!r.commands.includes(INLINE))
+    assert.ok(!r.commands.includes(BARE))
   })
 }
 
@@ -60,7 +64,8 @@ test('persistent corruption stops after one rebuild and falls back inline', asyn
   const r = runtime({ read: async () => ({ text: '{broken}' }) })
   assert.equal((await r.loadSnapshot()).kind, 'ready')
   assert.equal(r.commands.filter(c => c.includes(' > ')).length, 2)
-  assert.equal(r.commands.filter(c => c === "'tailscale' status --json").length, 1)
+  assert.equal(r.commands.filter(c => c === INLINE).length, 1)
+  assert.ok(!r.commands.includes(BARE))
 })
 
 test('persistent corruption and unusable inline output report the cache path and reason', async () => {
@@ -75,7 +80,8 @@ test('persistent corruption and unusable inline output report the cache path and
 test('a rejected cache write still allows a successful inline status', async () => {
   const r = runtime({ write: async () => { throw new Error('command timed out (30s)') } })
   assert.equal((await r.loadSnapshot()).kind, 'ready')
-  assert.equal(r.commands.filter(c => c === "'tailscale' status --json").length, 1)
+  assert.equal(r.commands.filter(c => c === INLINE).length, 1)
+  assert.ok(!r.commands.includes(BARE))
 })
 
 test('a rejected write with unusable inline output preserves the write reason', async () => {
