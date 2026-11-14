@@ -421,6 +421,18 @@ function isRemoteConnection(connectionId) {
   return typeof connectionId === 'string' && connectionId !== '' && connectionId !== 'local'
 }
 
+// `status --json` without the peer map: BackendState, Self and tailnet info
+// only, small enough for one inline shell.exec response.
+const SELF_STATUS_ARGS = 'status --json --peers=false'
+
+// Why the peer list is missing from a self-only status, or '' when present.
+function peersNote(status) {
+  if (!status || !status.peersUnavailable) return ''
+  return status.peersUnavailable === 'remote'
+    ? 'Peers unavailable: the connected host could not stream the full status'
+    : 'Peers unavailable: the status cache could not be used'
+}
+
 // Card body when the cache route produced nothing usable and the inline
 // fallback was the 4 KB tail. Names the cache path and the real reason;
 // never claims truncation for a write or a read failure. `connectionId`
@@ -763,6 +775,7 @@ function barLabel(snap) {
     if (kind === 'login') return 'ts login'
     if (kind === 'stopped') return 'ts stopped'
     if (kind === 'starting') return 'ts …'
+    if (snap.status.peersUnavailable) return 'ts on'
     const n = onlineCount(visibleRows(snap.status, false))
     return `ts ${n}`
   }
@@ -1322,14 +1335,20 @@ async function readRemotePosixStatus(bin, kind) {
 // One inline response: the only route on a remote Windows gateway and the
 // fallback on POSIX. A clipped status gets an honest error instead of the
 // desktop cache-path message (that file is not on the connected host).
+//
+// It asks for this device only (`--peers=false`). The full status of a large
+// tailnet is hundreds of KB; the gateway processes all of it (core shell.exec
+// redacts the whole stdout before taking the 4 KB tail) every poll, and the
+// tail is never complete JSON anyway. The self-only status fits and keeps
+// the chip working; peers are reported unavailable.
 async function readInlineStatus(bin, kind) {
-  const inline = await runShell(binCommand(bin, 'status --json', kind))
+  const inline = await runShell(binCommand(bin, SELF_STATUS_ARGS, kind))
   if (inline && inline.code) return { snapshot: statusCliFailure(inline) }
   const text = String((inline && inline.stdout) || '')
   if (!looksCompleteJson(text.trim())) {
     return { snapshot: { kind: 'error', message: remotePartialStatusMessage(kind) } }
   }
-  return { text }
+  return { text, peersUnavailable: 'remote' }
 }
 
 async function resolvePluginsRoot() {
@@ -1499,6 +1518,7 @@ async function loadSnapshot() {
   let cachePath = ''
   let cacheReason = 'bridge'
   let cacheDetail = ''
+  let peersUnavailable = ''
   try {
     if (remote) {
       const got = kind === 'windows'
@@ -1506,6 +1526,7 @@ async function loadSnapshot() {
         : await readRemotePosixStatus(probed.bin, kind)
       if (got.snapshot) return got.snapshot
       rawText = got.text || ''
+      peersUnavailable = got.peersUnavailable || ''
     } else {
       const outPath = await resolveOutPath(kind)
       cachePath = outPath
@@ -1517,10 +1538,12 @@ async function loadSnapshot() {
         cacheDetail = cycle.detail
       }
       if (!looksCompleteJson(rawText)) {
-        // The inline route returns the last 4,000 chars of stdout, which is
-        // never authoritative for a tailnet whose status exceeds 4 KB — it is
-        // only accepted below when it happens to be one complete JSON object.
-        const inline = await runShell(binCommand(probed.bin, 'status --json', kind))
+        // The inline route returns the last 4,000 chars of stdout, so the full
+        // `status --json` (hundreds of KB on a large tailnet) never comes back
+        // complete, yet the gateway still processes all of it. Ask for this
+        // device only: it fits, and peers are reported unavailable.
+        peersUnavailable = 'cache'
+        const inline = await runShell(binCommand(probed.bin, SELF_STATUS_ARGS, kind))
         if (inline && inline.code) {
           const why = classifyCliError(inline)
           if (why === 'missing') {
@@ -1559,6 +1582,7 @@ async function loadSnapshot() {
   }
   const status = parseStatus(parsed, Date.now())
   if (!status) return { kind: 'error', message: 'Tailscale status JSON was missing BackendState.' }
+  if (peersUnavailable) status.peersUnavailable = peersUnavailable
 
   let serve = { empty: true, url: '', proxy: '', hostPort: '' }
   let accounts = []
@@ -3290,7 +3314,9 @@ function PluginPageContent() {
   const total = rows.length
   const subtitle = status
     ? status.backend === 'Running'
-      ? `${online} online · ${total} machine${total === 1 ? '' : 's'}${status.suffix ? ` · ${status.suffix}` : ''}`
+      ? peersNote(status)
+        ? `${peersNote(status)}${status.suffix ? ` · ${status.suffix}` : ''}`
+        : `${online} online · ${total} machine${total === 1 ? '' : 's'}${status.suffix ? ` · ${status.suffix}` : ''}`
       : status.backend
     : snap.kind === 'loading'
       ? 'Looking up the local client'
